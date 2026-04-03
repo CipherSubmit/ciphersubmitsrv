@@ -22,4 +22,9 @@ tower-http = { version = "0.6", features = ["trace", "request-id", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+zip = "2.4"
+
+[dev-dependencies]
+tempfile = "3.19.1"
+tower = { version = "0.5", features = ["util"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }

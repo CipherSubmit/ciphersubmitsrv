@@ -1,23 +1,11 @@
-mod api;
-mod config;
-mod error;
-mod models;
-mod services;
-mod storage;
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum_server::tls_rustls::RustlsConfig;
-use config::AppConfig;
-use storage::Store;
+use ciphersubmitsrv::config::AppConfig;
+use ciphersubmitsrv::storage::Store;
+use ciphersubmitsrv::{api, error, services, AppState};
 use tracing::{error, info};
-
-#[derive(Clone)]
-pub struct AppState {
-    pub config: AppConfig,
-    pub store: Arc<Store>,
-}
 
 #[tokio::main]
 async fn main() {
