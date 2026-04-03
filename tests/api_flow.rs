@@ -22,6 +22,13 @@ use tempfile::tempdir;
 use tower::util::ServiceExt;
 use zip::write::SimpleFileOptions;
 
+const HEADER_NAME_B64: &str = "x-cisub-name-b64";
+const HEADER_STUDNUM_B64: &str = "x-cisub-studnum-b64";
+const HEADER_FILE_NAME_B64: &str = "x-cisub-file-name-b64";
+const HEADER_FILE_SHA256: &str = "x-cisub-file-sha256";
+const HEADER_ENCRYPTED_KEY_B64: &str = "x-cisub-encrypted-key-b64";
+const HEADER_NONCE_B64: &str = "x-cisub-nonce-b64";
+
 #[derive(Debug, Deserialize)]
 struct SubmissionAcceptedResponse {
     submission_id: String,
@@ -49,15 +56,17 @@ struct FetchItem {
     studnum: String,
     file_name: String,
     mode: String,
-    payload: SubmissionPayload,
+    download: DownloadDescriptor,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-enum SubmissionPayload {
-    Link { file_b64: String },
-    E2e { envelope: Envelope },
+enum DownloadDescriptor {
+    Link,
+    E2e {
+        encrypted_key_b64: String,
+        nonce_b64: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,17 +190,11 @@ async fn link_submission_auth_and_fetch_flow() {
     let submit_request = Request::builder()
         .method("POST")
         .uri("/api/v1/submissions/link")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "name": "Alice",
-                "studnum": "20260001",
-                "file_name": "homework.zip",
-                "file_sha256": zip_sha256,
-                "file_b64": STANDARD.encode(&zip_bytes),
-            })
-            .to_string(),
-        ))
+        .header(HEADER_NAME_B64, STANDARD.encode("Alice"))
+        .header(HEADER_STUDNUM_B64, STANDARD.encode("20260001"))
+        .header(HEADER_FILE_NAME_B64, STANDARD.encode("homework.zip"))
+        .header(HEADER_FILE_SHA256, zip_sha256)
+        .body(Body::from(zip_bytes.clone()))
         .expect("应该能构造提交请求");
 
     let (status, accepted): (StatusCode, SubmissionAcceptedResponse) =
@@ -217,37 +220,29 @@ async fn link_submission_auth_and_fetch_flow() {
     assert_eq!(item.file_name, "homework.zip");
     assert_eq!(item.mode, "link");
 
-    match &item.payload {
-        SubmissionPayload::Link { file_b64 } => {
-            assert_eq!(STANDARD.decode(file_b64).expect("返回文件应可解码"), zip_bytes);
-        }
-        SubmissionPayload::E2e { .. } => panic!("link 提交不应返回 e2e payload"),
+    match &item.download {
+        DownloadDescriptor::Link => {}
+        DownloadDescriptor::E2e { .. } => panic!("link 提交不应返回 e2e 下载描述"),
     }
 }
 
 #[tokio::test]
 async fn e2e_submission_is_visible_in_admin_detail() {
     let (_temp_dir, app) = test_app();
-    let envelope = Envelope {
-        encrypted_key_b64: STANDARD.encode(b"encrypted-key"),
-        nonce_b64: STANDARD.encode(b"123456789012"),
-        ciphertext_b64: STANDARD.encode(b"ciphertext"),
-    };
+    let encrypted_key_b64 = STANDARD.encode(b"encrypted-key");
+    let nonce_b64 = STANDARD.encode(b"123456789012");
+    let ciphertext = b"ciphertext";
 
     let submit_request = Request::builder()
         .method("POST")
         .uri("/api/v1/submissions/e2e")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "name": "Bob",
-                "studnum": "20260002",
-                "file_name": "project.zip",
-                "file_sha256": "dummy-client-side-sha256",
-                "envelope": envelope,
-            })
-            .to_string(),
-        ))
+        .header(HEADER_NAME_B64, STANDARD.encode("Bob"))
+        .header(HEADER_STUDNUM_B64, STANDARD.encode("20260002"))
+        .header(HEADER_FILE_NAME_B64, STANDARD.encode("project.zip"))
+        .header(HEADER_FILE_SHA256, "dummy-client-side-sha256")
+        .header(HEADER_ENCRYPTED_KEY_B64, encrypted_key_b64)
+        .header(HEADER_NONCE_B64, nonce_b64)
+        .body(Body::from(ciphertext.as_slice().to_vec()))
         .expect("应该能构造 e2e 提交请求");
 
     let (status, accepted): (StatusCode, SubmissionAcceptedResponse) =
@@ -266,5 +261,50 @@ async fn e2e_submission_is_visible_in_admin_detail() {
     assert_eq!(detail.submission_id, accepted.submission_id);
     assert_eq!(detail.status, "ciphertext_only");
     assert!(!detail.server_can_read_content);
-    assert_eq!(detail.envelope.expect("应该包含 envelope").ciphertext_b64, STANDARD.encode(b"ciphertext"));
+    let envelope = detail.envelope.expect("应该包含 envelope");
+    assert_eq!(envelope.ciphertext_b64, STANDARD.encode(ciphertext));
+}
+
+#[tokio::test]
+async fn fetch_list_returns_e2e_download_metadata() {
+    let (_temp_dir, app) = test_app();
+    let encrypted_key_b64 = STANDARD.encode(b"encrypted-key");
+    let nonce_b64 = STANDARD.encode(b"123456789012");
+
+    let submit_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/submissions/e2e")
+        .header(HEADER_NAME_B64, STANDARD.encode("Bob"))
+        .header(HEADER_STUDNUM_B64, STANDARD.encode("20260002"))
+        .header(HEADER_FILE_NAME_B64, STANDARD.encode("project.zip"))
+        .header(HEADER_FILE_SHA256, "dummy-client-side-sha256")
+        .header(HEADER_ENCRYPTED_KEY_B64, encrypted_key_b64.clone())
+        .header(HEADER_NONCE_B64, nonce_b64.clone())
+        .body(Body::from(b"ciphertext".to_vec()))
+        .expect("应该能构造 e2e 提交请求");
+
+    let (status, _accepted): (StatusCode, SubmissionAcceptedResponse) =
+        request_json(&app, submit_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let token = issue_teacher_token(&app).await;
+    let fetch_request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/submissions/20260002")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("应该能构造取件请求");
+
+    let (status, response): (StatusCode, ItemsResponse) = request_json(&app, fetch_request).await;
+    assert_eq!(status, StatusCode::OK);
+    match &response.items[0].download {
+        DownloadDescriptor::E2e {
+            encrypted_key_b64: actual_key,
+            nonce_b64: actual_nonce,
+        } => {
+            assert_eq!(actual_key, &encrypted_key_b64);
+            assert_eq!(actual_nonce, &nonce_b64);
+        }
+        DownloadDescriptor::Link => panic!("e2e 提交不应返回 link 下载描述"),
+    }
 }

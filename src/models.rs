@@ -129,14 +129,17 @@ pub struct FetchItem {
     pub file_name: String,
     pub accepted_at: String,
     pub mode: SubmissionMode,
-    pub payload: SubmissionPayload,
+    pub download: DownloadDescriptor,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
-pub enum SubmissionPayload {
-    Link { file_b64: String },
-    E2e { envelope: Envelope },
+pub enum DownloadDescriptor {
+    Link,
+    E2e {
+        encrypted_key_b64: String,
+        nonce_b64: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -1,16 +1,18 @@
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use axum::body::Body;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
+use futures_util::StreamExt;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::{Oaep, RsaPublicKey};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use zip::ZipArchive;
 
@@ -100,6 +102,24 @@ pub fn validate_envelope(envelope: &Envelope) -> AppResult<()> {
     Ok(())
 }
 
+pub fn validate_streamed_envelope_fields(
+    encrypted_key_b64: &str,
+    nonce_b64: &str,
+) -> AppResult<()> {
+    let encrypted_key = decode_base64_field("encrypted_key_b64", encrypted_key_b64)?;
+    let nonce = decode_base64_field("nonce_b64", nonce_b64)?;
+
+    if encrypted_key.is_empty() || nonce.is_empty() {
+        return Err(AppError::bad_request("envelope 字段不能为空"));
+    }
+
+    if nonce.len() != 12 {
+        return Err(AppError::bad_request("nonce_b64 解码后必须为 12 字节"));
+    }
+
+    Ok(())
+}
+
 pub fn save_link_file(config: &AppConfig, submission_id: &str, bytes: &[u8]) -> AppResult<PathBuf> {
     let path = config
         .data_dir
@@ -108,6 +128,20 @@ pub fn save_link_file(config: &AppConfig, submission_id: &str, bytes: &[u8]) -> 
         .join(format!("{submission_id}.zip"));
     write_bytes(&path, bytes)?;
     Ok(path)
+}
+
+pub async fn save_link_file_stream(
+    config: &AppConfig,
+    submission_id: &str,
+    body: Body,
+) -> AppResult<(PathBuf, String)> {
+    let path = config
+        .data_dir
+        .join("submissions")
+        .join("link")
+        .join(format!("{submission_id}.zip"));
+    let sha256 = stream_body_to_file(&path, body).await?;
+    Ok((path, sha256))
 }
 
 pub fn save_e2e_envelope(
@@ -126,14 +160,45 @@ pub fn save_e2e_envelope(
     Ok(path)
 }
 
+pub async fn save_e2e_envelope_stream(
+    config: &AppConfig,
+    submission_id: &str,
+    encrypted_key_b64: &str,
+    nonce_b64: &str,
+    body: Body,
+) -> AppResult<PathBuf> {
+    let metadata_path = config
+        .data_dir
+        .join("submissions")
+        .join("e2e")
+        .join(format!("{submission_id}.json"));
+    let ciphertext_path = e2e_ciphertext_path(&metadata_path);
+    let metadata = StoredEnvelopeMetadata {
+        encrypted_key_b64: encrypted_key_b64.to_string(),
+        nonce_b64: nonce_b64.to_string(),
+    };
+    let content = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| AppError::internal(format!("序列化 envelope 元数据失败: {error}")))?;
+
+    write_bytes(&metadata_path, &content)?;
+    if let Err(error) = stream_body_to_file(&ciphertext_path, body).await {
+        let _ = remove_file_if_exists(&metadata_path);
+        let _ = remove_file_if_exists(&ciphertext_path);
+        return Err(error);
+    }
+
+    Ok(metadata_path)
+}
+
 pub fn inspect_link_submission(
     store: &Store,
     submission_id: &str,
-    zip_bytes: &[u8],
+    zip_path: &Path,
     server_sha256: &str,
 ) -> AppResult<LinkInspectionRecord> {
-    let cursor = Cursor::new(zip_bytes.to_vec());
-    let mut archive = ZipArchive::new(cursor)
+    let file = fs::File::open(zip_path)
+        .map_err(|error| AppError::internal(format!("读取 ZIP 文件失败: {error}")))?;
+    let mut archive = ZipArchive::new(file)
         .map_err(|error| AppError::bad_request(format!("上传文件不是合法 ZIP: {error}")))?;
 
     let mut has_git_dir = false;
@@ -275,11 +340,35 @@ pub fn load_link_file_b64(path: &Path) -> AppResult<String> {
     Ok(STANDARD.encode(bytes))
 }
 
+pub fn load_e2e_envelope_metadata(path: &Path) -> AppResult<(String, String)> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| AppError::internal(format!("读取 envelope 元数据失败: {error}")))?;
+    let metadata: StoredEnvelopeMetadata = serde_json::from_str(&content)
+        .map_err(|error| AppError::internal(format!("解析 envelope 元数据失败: {error}")))?;
+
+    Ok((metadata.encrypted_key_b64, metadata.nonce_b64))
+}
+
+pub fn submission_download_path(mode: &SubmissionMode, storage_path: &Path) -> PathBuf {
+    match mode {
+        SubmissionMode::Link => storage_path.to_path_buf(),
+        SubmissionMode::E2e => e2e_ciphertext_path(storage_path),
+    }
+}
+
 pub fn load_e2e_envelope(path: &Path) -> AppResult<Envelope> {
     let content = fs::read_to_string(path)
-        .map_err(|error| AppError::internal(format!("读取 envelope 文件失败: {error}")))?;
-    serde_json::from_str(&content)
-        .map_err(|error| AppError::internal(format!("解析 envelope 文件失败: {error}")))
+        .map_err(|error| AppError::internal(format!("读取 envelope 元数据失败: {error}")))?;
+    let metadata: StoredEnvelopeMetadata = serde_json::from_str(&content)
+        .map_err(|error| AppError::internal(format!("解析 envelope 元数据失败: {error}")))?;
+    let ciphertext = fs::read(e2e_ciphertext_path(path))
+        .map_err(|error| AppError::internal(format!("读取密文文件失败: {error}")))?;
+
+    Ok(Envelope {
+        encrypted_key_b64: metadata.encrypted_key_b64,
+        nonce_b64: metadata.nonce_b64,
+        ciphertext_b64: STANDARD.encode(ciphertext),
+    })
 }
 
 pub fn cleanup_expired_submissions(store: &Store) -> AppResult<Vec<String>> {
@@ -288,7 +377,7 @@ pub fn cleanup_expired_submissions(store: &Store) -> AppResult<Vec<String>> {
     let mut deleted = Vec::new();
 
     for (submission_id, storage_path) in expired {
-        remove_file_if_exists(Path::new(&storage_path))?;
+        remove_submission_payload_files(Path::new(&storage_path))?;
         store.mark_submission_deleted(&submission_id)?;
         deleted.push(submission_id);
     }
@@ -303,6 +392,74 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> AppResult<()> {
     }
 
     fs::write(path, bytes).map_err(|error| AppError::internal(format!("写入文件失败: {error}")))
+}
+
+async fn stream_body_to_file(path: &Path, body: Body) -> AppResult<String> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| AppError::internal(format!("创建文件目录失败: {error}")))?;
+    }
+
+    let temp_path = temporary_upload_path(path);
+    let mut file = tokio::fs::File::create(&temp_path)
+        .await
+        .map_err(|error| AppError::internal(format!("创建临时上传文件失败: {error}")))?;
+    let mut stream = body.into_data_stream();
+    let mut hasher = Sha256::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| AppError::bad_request(format!("读取请求体失败: {error}")))?;
+        if chunk.is_empty() {
+            continue;
+        }
+
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| AppError::internal(format!("写入上传文件失败: {error}")))?;
+        hasher.update(&chunk);
+    }
+
+    file.flush()
+        .await
+        .map_err(|error| AppError::internal(format!("刷新上传文件失败: {error}")))?;
+    drop(file);
+
+    tokio::fs::rename(&temp_path, path)
+        .await
+        .map_err(|error| AppError::internal(format!("保存上传文件失败: {error}")))?;
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn temporary_upload_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".part");
+    PathBuf::from(os)
+}
+
+fn remove_submission_payload_files(path: &Path) -> AppResult<()> {
+    remove_file_if_exists(path)?;
+    if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        let ciphertext_path = e2e_ciphertext_path(path);
+        remove_file_if_exists(&ciphertext_path)?;
+    }
+    Ok(())
+}
+
+fn e2e_ciphertext_path(metadata_path: &Path) -> PathBuf {
+    if metadata_path.extension().and_then(|value| value.to_str()) == Some("json") {
+        metadata_path.with_extension("bin")
+    } else {
+        metadata_path.to_path_buf()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredEnvelopeMetadata {
+    encrypted_key_b64: String,
+    nonce_b64: String,
 }
 
 fn is_git_trace(path: &str) -> bool {

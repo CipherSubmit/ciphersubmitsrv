@@ -1,6 +1,7 @@
 use std::path::Path;
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
+use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -8,36 +9,45 @@ use axum::{Json, Router};
 use base64::Engine;
 use chrono::Utc;
 use serde::Deserialize;
+use tokio_util::io::ReaderStream;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ChallengeResponse, CleanupResponse, Envelope, FetchItem, ItemsResponse, RetentionPolicyView,
+    ChallengeResponse, CleanupResponse, FetchItem, ItemsResponse, RetentionPolicyView,
     RetentionStatus, RetrievalEventView, SubmissionAcceptedResponse, SubmissionDetailResponse,
-    SubmissionMode, SubmissionOverviewItem, SubmissionPayload, SubmissionStatus,
+    SubmissionMode, SubmissionOverviewItem, DownloadDescriptor, SubmissionStatus,
     TeacherActivityResponse, TeacherChallengeView, TeacherTokenView, VerifyResponse,
 };
 use crate::services;
+use crate::storage::remove_file_if_exists;
 use crate::AppState;
 
-#[derive(Debug, Deserialize)]
-struct LinkSubmissionRequest {
+const HEADER_NAME_B64: &str = "x-cisub-name-b64";
+const HEADER_STUDNUM_B64: &str = "x-cisub-studnum-b64";
+const HEADER_FILE_NAME_B64: &str = "x-cisub-file-name-b64";
+const HEADER_FILE_SHA256: &str = "x-cisub-file-sha256";
+const HEADER_ENCRYPTED_KEY_B64: &str = "x-cisub-encrypted-key-b64";
+const HEADER_NONCE_B64: &str = "x-cisub-nonce-b64";
+
+#[derive(Debug)]
+struct LinkSubmissionMetadata {
     name: String,
     studnum: String,
     file_name: String,
     file_sha256: String,
-    file_b64: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct E2ESubmissionRequest {
+#[derive(Debug)]
+struct E2ESubmissionMetadata {
     name: String,
     studnum: String,
     file_name: String,
     file_sha256: String,
-    envelope: Envelope,
+    encrypted_key_b64: String,
+    nonce_b64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +68,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/submissions/link", post(submit_link))
         .route("/api/v1/submissions/e2e", post(submit_e2e))
         .route("/api/v1/submissions", get(fetch_all_submissions))
+        .route(
+            "/api/v1/submissions/download/{submission_id}",
+            get(download_submission_payload),
+        )
         .route(
             "/api/v1/submissions/{studnum}",
             get(fetch_submissions_by_studnum),
@@ -84,6 +98,7 @@ pub fn router(state: AppState) -> Router {
             header::HeaderName::from_static("x-request-id"),
             MakeRequestUuid,
         ))
+        .layer(DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
@@ -115,25 +130,26 @@ async fn frontend_not_built() -> impl IntoResponse {
 
 async fn submit_link(
     State(state): State<AppState>,
-    Json(payload): Json<LinkSubmissionRequest>,
+    request: Request,
 ) -> AppResult<Json<SubmissionAcceptedResponse>> {
+    let (parts, body) = request.into_parts();
+    let payload = parse_link_metadata(&parts.headers)?;
+
     ensure_non_empty(&payload.name, "name")?;
     ensure_non_empty(&payload.studnum, "studnum")?;
     ensure_non_empty(&payload.file_name, "file_name")?;
     ensure_non_empty(&payload.file_sha256, "file_sha256")?;
-    ensure_non_empty(&payload.file_b64, "file_b64")?;
 
-    let zip_bytes = services::decode_base64_field("file_b64", &payload.file_b64)?;
-    let server_sha256 = services::sha256_hex(&zip_bytes);
+    let submission_id = services::generate_submission_id();
+    let (storage_path, server_sha256) =
+        services::save_link_file_stream(&state.config, &submission_id, body).await?;
 
     if server_sha256 != payload.file_sha256 {
+        let _ = remove_file_if_exists(&storage_path);
         return Err(AppError::bad_request(
             "file_sha256 与服务端收到的 ZIP 原文不一致",
         ));
     }
-
-    let submission_id = services::generate_submission_id();
-    let storage_path = services::save_link_file(&state.config, &submission_id, &zip_bytes)?;
 
     let record = services::build_submission_record(
         submission_id.clone(),
@@ -148,12 +164,18 @@ async fn submit_link(
     );
     state.store.insert_submission(&record)?;
 
-    let inspection = services::inspect_link_submission(
+    let inspection = match services::inspect_link_submission(
         &state.store,
         &submission_id,
-        &zip_bytes,
+        &storage_path,
         &server_sha256,
-    )?;
+    ) {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            let _ = remove_file_if_exists(&storage_path);
+            return Err(error);
+        }
+    };
     state.store.insert_link_inspection(&inspection)?;
     state
         .store
@@ -168,17 +190,29 @@ async fn submit_link(
 
 async fn submit_e2e(
     State(state): State<AppState>,
-    Json(payload): Json<E2ESubmissionRequest>,
+    request: Request,
 ) -> AppResult<Json<SubmissionAcceptedResponse>> {
+    let (parts, body) = request.into_parts();
+    let payload = parse_e2e_metadata(&parts.headers)?;
+
     ensure_non_empty(&payload.name, "name")?;
     ensure_non_empty(&payload.studnum, "studnum")?;
     ensure_non_empty(&payload.file_name, "file_name")?;
     ensure_non_empty(&payload.file_sha256, "file_sha256")?;
-    services::validate_envelope(&payload.envelope)?;
+    services::validate_streamed_envelope_fields(
+        &payload.encrypted_key_b64,
+        &payload.nonce_b64,
+    )?;
 
     let submission_id = services::generate_submission_id();
-    let storage_path =
-        services::save_e2e_envelope(&state.config, &submission_id, &payload.envelope)?;
+    let storage_path = services::save_e2e_envelope_stream(
+        &state.config,
+        &submission_id,
+        &payload.encrypted_key_b64,
+        &payload.nonce_b64,
+        body,
+    )
+    .await?;
     let server_sha256 = payload.file_sha256.clone();
 
     let record = services::build_submission_record(
@@ -284,7 +318,6 @@ async fn fetch_all_submissions(
     }
 
     let response = build_items_response(&state, &records)?;
-    schedule_retrieval_if_needed(&state, &response.items)?;
 
     Ok(Json(response))
 }
@@ -302,9 +335,44 @@ async fn fetch_submissions_by_studnum(
     }
 
     let response = build_items_response(&state, &records)?;
-    schedule_retrieval_if_needed(&state, &response.items)?;
 
     Ok(Json(response))
+}
+
+async fn download_submission_payload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(submission_id): AxumPath<String>,
+) -> AppResult<impl IntoResponse> {
+    let _token = authorize_teacher(&state, &headers)?;
+    let record = state
+        .store
+        .get_submission_by_id(&submission_id)?
+        .ok_or_else(|| AppError::not_found("submission_id 不存在"))?;
+    let download_path = services::submission_download_path(&record.mode, Path::new(&record.storage_path));
+    let file = tokio::fs::File::open(&download_path)
+        .await
+        .map_err(|error| AppError::internal(format!("打开下载文件失败: {error}")))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| AppError::internal(format!("读取下载文件元数据失败: {error}")))?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    let scheduled_delete_at = services::calculate_scheduled_delete_at(&state.config);
+    let retrieved_at = services::format_rfc3339(Utc::now());
+    let submission_ids = vec![record.submission_id.clone()];
+    state
+        .store
+        .schedule_submission_deletion(&submission_ids, &retrieved_at, &scheduled_delete_at)?;
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, metadata.len().to_string()),
+        ],
+        body,
+    ))
 }
 
 async fn admin_overview(
@@ -463,13 +531,16 @@ fn build_items_response(
     let mut items = Vec::with_capacity(records.len());
 
     for record in records {
-        let payload = match record.mode {
-            SubmissionMode::Link => SubmissionPayload::Link {
-                file_b64: services::load_link_file_b64(Path::new(&record.storage_path))?,
-            },
-            SubmissionMode::E2e => SubmissionPayload::E2e {
-                envelope: services::load_e2e_envelope(Path::new(&record.storage_path))?,
-            },
+        let download = match record.mode {
+            SubmissionMode::Link => DownloadDescriptor::Link,
+            SubmissionMode::E2e => {
+                let (encrypted_key_b64, nonce_b64) =
+                    services::load_e2e_envelope_metadata(Path::new(&record.storage_path))?;
+                DownloadDescriptor::E2e {
+                    encrypted_key_b64,
+                    nonce_b64,
+                }
+            }
         };
 
         let item = FetchItem {
@@ -478,43 +549,14 @@ fn build_items_response(
             file_name: record.file_name.clone(),
             accepted_at: services::format_rfc3339(record.accepted_at),
             mode: record.mode.clone(),
-            payload,
+            download,
         };
-
-        if !mode_matches_payload(&item) {
-            return Err(AppError::internal("mode 与 payload.kind 不一致"));
-        }
 
         items.push(item);
     }
 
     let _ = state;
     Ok(ItemsResponse { items })
-}
-
-fn schedule_retrieval_if_needed(state: &AppState, items: &[FetchItem]) -> AppResult<()> {
-    if items.is_empty() {
-        return Ok(());
-    }
-
-    let retrieved_at = services::format_rfc3339(Utc::now());
-    let scheduled_delete_at = services::calculate_scheduled_delete_at(&state.config);
-    let submission_ids = items
-        .iter()
-        .map(|item| item.submission_id.clone())
-        .collect::<Vec<_>>();
-
-    state
-        .store
-        .schedule_submission_deletion(&submission_ids, &retrieved_at, &scheduled_delete_at)
-}
-
-fn mode_matches_payload(item: &FetchItem) -> bool {
-    matches!(
-        (&item.mode, &item.payload),
-        (SubmissionMode::Link, SubmissionPayload::Link { .. })
-            | (SubmissionMode::E2e, SubmissionPayload::E2e { .. })
-    )
 }
 
 fn ensure_non_empty(value: &str, field_name: &str) -> AppResult<()> {
@@ -525,23 +567,110 @@ fn ensure_non_empty(value: &str, field_name: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn parse_link_metadata(headers: &HeaderMap) -> AppResult<LinkSubmissionMetadata> {
+    Ok(LinkSubmissionMetadata {
+        name: decode_b64_header(headers, HEADER_NAME_B64)?,
+        studnum: decode_b64_header(headers, HEADER_STUDNUM_B64)?,
+        file_name: decode_b64_header(headers, HEADER_FILE_NAME_B64)?,
+        file_sha256: required_header(headers, HEADER_FILE_SHA256)?,
+    })
+}
+
+fn parse_e2e_metadata(headers: &HeaderMap) -> AppResult<E2ESubmissionMetadata> {
+    Ok(E2ESubmissionMetadata {
+        name: decode_b64_header(headers, HEADER_NAME_B64)?,
+        studnum: decode_b64_header(headers, HEADER_STUDNUM_B64)?,
+        file_name: decode_b64_header(headers, HEADER_FILE_NAME_B64)?,
+        file_sha256: required_header(headers, HEADER_FILE_SHA256)?,
+        encrypted_key_b64: required_header(headers, HEADER_ENCRYPTED_KEY_B64)?,
+        nonce_b64: required_header(headers, HEADER_NONCE_B64)?,
+    })
+}
+
+fn required_header(headers: &HeaderMap, header_name: &str) -> AppResult<String> {
+    headers
+        .get(header_name)
+        .ok_or_else(|| AppError::bad_request(format!("缺少请求头 {header_name}")))?
+        .to_str()
+        .map(|value| value.to_string())
+        .map_err(|_| AppError::bad_request(format!("请求头 {header_name} 不是合法 UTF-8")))
+}
+
+fn decode_b64_header(headers: &HeaderMap, header_name: &str) -> AppResult<String> {
+    let value = required_header(headers, header_name)?;
+    let bytes = services::decode_base64_field(header_name, &value)?;
+    String::from_utf8(bytes)
+        .map_err(|_| AppError::bad_request(format!("请求头 {header_name} 不是合法 UTF-8 数据")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::mode_matches_payload;
-    use crate::models::{FetchItem, SubmissionMode, SubmissionPayload};
+    use super::build_items_response;
+    use crate::config::AppConfig;
+    use crate::models::{DownloadDescriptor, FetchItem, SubmissionMode, SubmissionRecord, SubmissionStatus};
+    use crate::storage::Store;
+    use crate::AppState;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     #[test]
-    fn payload_kind_must_match_mode() {
-        let item = FetchItem {
-            submission_id: "sub-1".to_string(),
-            studnum: "20260001".to_string(),
-            file_name: "homework.zip".to_string(),
-            accepted_at: "2026-04-03T12:00:00Z".to_string(),
-            mode: SubmissionMode::Link,
-            payload: SubmissionPayload::Link {
-                file_b64: "UEsDBA==".to_string(),
-            },
+    fn build_items_response_includes_e2e_download_metadata() {
+        let temp_dir = tempdir().expect("应该能创建临时目录");
+        let data_dir = temp_dir.path().join("data");
+        std::fs::create_dir_all(data_dir.join("submissions/e2e")).expect("应该能创建目录");
+        let storage_path = data_dir.join("submissions/e2e/sub-1.json");
+        std::fs::write(
+            &storage_path,
+            r#"{
+  "encrypted_key_b64": "ZW5jcnlwdGVk",
+  "nonce_b64": "MTIzNDU2Nzg5MDEy"
+}"#,
+        )
+        .expect("应该能写入元数据");
+
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".to_string(),
+            db_path: data_dir.join("db.sqlite3"),
+            data_dir: data_dir.clone(),
+            frontend_dist_dir: temp_dir.path().join("frontend-dist"),
+            tls_cert_path: data_dir.join("tls/server-cert.pem"),
+            tls_key_path: data_dir.join("tls/server-key.pem"),
+            challenge_ttl_secs: 300,
+            token_ttl_secs: 1800,
+            retrieval_delete_delay_secs: 3600,
         };
-        assert!(mode_matches_payload(&item));
+        let state = AppState {
+            config: config.clone(),
+            store: Arc::new(Store::new(&config).expect("应该能创建存储")),
+        };
+        let records = vec![SubmissionRecord {
+            submission_id: "sub-1".to_string(),
+            name: "Bob".to_string(),
+            studnum: "20260002".to_string(),
+            file_name: "project.zip".to_string(),
+            file_sha256: "dummy".to_string(),
+            accepted_at: Utc::now(),
+            mode: SubmissionMode::E2e,
+            payload_kind: SubmissionMode::E2e,
+            storage_path: storage_path.display().to_string(),
+            status: SubmissionStatus::CiphertextOnly,
+            server_sha256: "dummy".to_string(),
+            retrieved_at: None,
+            scheduled_delete_at: None,
+        }];
+
+        let response = build_items_response(&state, &records).expect("应该能构建响应");
+        let item: &FetchItem = &response.items[0];
+        match &item.download {
+            DownloadDescriptor::E2e {
+                encrypted_key_b64,
+                nonce_b64,
+            } => {
+                assert_eq!(encrypted_key_b64, "ZW5jcnlwdGVk");
+                assert_eq!(nonce_b64, "MTIzNDU2Nzg5MDEy");
+            }
+            DownloadDescriptor::Link => panic!("e2e 项不应返回 link 下载描述"),
+        }
     }
 }
