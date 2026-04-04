@@ -65,6 +65,12 @@ pub struct Envelope {
     pub ciphertext_b64: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct E2EEnvelopeMetadata {
+    pub encrypted_key_b64: String,
+    pub nonce_b64: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct SubmissionRecord {
     pub submission_id: String,
@@ -117,6 +123,14 @@ pub struct TeacherTokenRecord {
     pub bound_public_key_fingerprint: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct AdminTokenRecord {
+    pub token: String,
+    pub username: String,
+    pub issued_at: String,
+    pub expires_at: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ItemsResponse {
     pub items: Vec<FetchItem>,
@@ -166,7 +180,7 @@ pub struct SubmissionDetailResponse {
     pub status: SubmissionStatus,
     pub server_can_read_content: bool,
     pub inspection: Option<LinkInspectionRecord>,
-    pub envelope: Option<Envelope>,
+    pub envelope: Option<E2EEnvelopeMetadata>,
     pub retention: RetentionStatus,
 }
 
@@ -185,6 +199,18 @@ pub struct ChallengeResponse {
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifyResponse {
     pub access_token: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdminLoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AdminLoginResponse {
+    pub access_token: String,
+    pub expires_at: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub frontend_dist_dir: PathBuf,
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
+    pub admin_username: String,
+    pub admin_password: String,
     pub challenge_ttl_secs: i64,
     pub token_ttl_secs: i64,
     pub retrieval_delete_delay_secs: i64,
@@ -52,6 +54,10 @@ impl AppConfig {
                 env::var("CISUB_TLS_KEY")
                     .unwrap_or_else(|_| tls_dir.join("server-key.pem").display().to_string()),
             ),
+            admin_username: env::var("CISUB_ADMIN_USERNAME")
+                .unwrap_or_else(|_| "admin".to_string()),
+            admin_password: env::var("CISUB_ADMIN_PASSWORD")
+                .unwrap_or_else(|_| "admin123".to_string()),
             challenge_ttl_secs: read_i64("CISUB_CHALLENGE_TTL_SECS", 300)?,
             token_ttl_secs: read_i64("CISUB_TOKEN_TTL_SECS", 1800)?,
             retrieval_delete_delay_secs: read_i64("CISUB_DELETE_DELAY_SECS", 3600)?,

@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
 use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -16,10 +16,11 @@ use tower_http::trace::TraceLayer;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ChallengeResponse, CleanupResponse, FetchItem, ItemsResponse, RetentionPolicyView,
-    RetentionStatus, RetrievalEventView, SubmissionAcceptedResponse, SubmissionDetailResponse,
-    SubmissionMode, SubmissionOverviewItem, DownloadDescriptor, SubmissionStatus,
-    TeacherActivityResponse, TeacherChallengeView, TeacherTokenView, VerifyResponse,
+    AdminLoginRequest, AdminLoginResponse, ChallengeResponse, CleanupResponse, DownloadDescriptor,
+    E2EEnvelopeMetadata, FetchItem, ItemsResponse, RetentionPolicyView, RetentionStatus,
+    RetrievalEventView, SubmissionAcceptedResponse, SubmissionDetailResponse, SubmissionMode,
+    SubmissionOverviewItem, SubmissionStatus, TeacherActivityResponse, TeacherChallengeView,
+    TeacherTokenView, VerifyResponse,
 };
 use crate::services;
 use crate::storage::remove_file_if_exists;
@@ -84,7 +85,12 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/auth/teacher/verify",
             post(verify_teacher_challenge),
         )
+        .route("/api/v1/admin/auth/login", post(admin_login))
         .route("/api/v1/admin/overview", get(admin_overview))
+        .route(
+            "/api/v1/admin/submissions/download/{submission_id}",
+            get(admin_download_submission_payload),
+        )
         .route(
             "/api/v1/admin/submissions/{submission_id}",
             get(admin_submission_detail),
@@ -199,10 +205,7 @@ async fn submit_e2e(
     ensure_non_empty(&payload.studnum, "studnum")?;
     ensure_non_empty(&payload.file_name, "file_name")?;
     ensure_non_empty(&payload.file_sha256, "file_sha256")?;
-    services::validate_streamed_envelope_fields(
-        &payload.encrypted_key_b64,
-        &payload.nonce_b64,
-    )?;
+    services::validate_streamed_envelope_fields(&payload.encrypted_key_b64, &payload.nonce_b64)?;
 
     let submission_id = services::generate_submission_id();
     let storage_path = services::save_e2e_envelope_stream(
@@ -306,6 +309,28 @@ async fn verify_teacher_challenge(
     }))
 }
 
+async fn admin_login(
+    State(state): State<AppState>,
+    Json(payload): Json<AdminLoginRequest>,
+) -> AppResult<Json<AdminLoginResponse>> {
+    ensure_non_empty(&payload.username, "username")?;
+    ensure_non_empty(&payload.password, "password")?;
+
+    if payload.username != state.config.admin_username
+        || payload.password != state.config.admin_password
+    {
+        return Err(AppError::unauthorized("用户名或密码错误"));
+    }
+
+    let token = services::build_admin_token(&payload.username, &state.config);
+    state.store.insert_admin_token(&token)?;
+
+    Ok(Json(AdminLoginResponse {
+        access_token: token.token,
+        expires_at: token.expires_at,
+    }))
+}
+
 async fn fetch_all_submissions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -349,35 +374,28 @@ async fn download_submission_payload(
         .store
         .get_submission_by_id(&submission_id)?
         .ok_or_else(|| AppError::not_found("submission_id 不存在"))?;
-    let download_path = services::submission_download_path(&record.mode, Path::new(&record.storage_path));
-    let file = tokio::fs::File::open(&download_path)
-        .await
-        .map_err(|error| AppError::internal(format!("打开下载文件失败: {error}")))?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|error| AppError::internal(format!("读取下载文件元数据失败: {error}")))?;
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
-    let scheduled_delete_at = services::calculate_scheduled_delete_at(&state.config);
-    let retrieved_at = services::format_rfc3339(Utc::now());
-    let submission_ids = vec![record.submission_id.clone()];
-    state
-        .store
-        .schedule_submission_deletion(&submission_ids, &retrieved_at, &scheduled_delete_at)?;
+    build_download_response(&state, &record, true).await
+}
 
-    Ok((
-        [
-            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-            (header::CONTENT_LENGTH, metadata.len().to_string()),
-        ],
-        body,
-    ))
+async fn admin_download_submission_payload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(submission_id): AxumPath<String>,
+) -> AppResult<impl IntoResponse> {
+    let _token = authorize_admin(&state, &headers)?;
+    let record = state
+        .store
+        .get_submission_by_id(&submission_id)?
+        .ok_or_else(|| AppError::not_found("submission_id 不存在"))?;
+
+    build_download_response(&state, &record, false).await
 }
 
 async fn admin_overview(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> AppResult<Json<Vec<SubmissionOverviewItem>>> {
+    let _token = authorize_admin(&state, &headers)?;
     let records = state.store.list_submissions(None)?;
     let items = records
         .into_iter()
@@ -398,8 +416,10 @@ async fn admin_overview(
 
 async fn admin_submission_detail(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(submission_id): AxumPath<String>,
 ) -> AppResult<Json<SubmissionDetailResponse>> {
+    let _token = authorize_admin(&state, &headers)?;
     let record = state
         .store
         .get_submission_by_id(&submission_id)?
@@ -407,9 +427,12 @@ async fn admin_submission_detail(
 
     let inspection = state.store.get_link_inspection(&record.submission_id)?;
     let envelope = if record.mode == SubmissionMode::E2e {
-        Some(services::load_e2e_envelope(Path::new(
-            &record.storage_path,
-        ))?)
+        let (encrypted_key_b64, nonce_b64) =
+            services::load_e2e_envelope_metadata(Path::new(&record.storage_path))?;
+        Some(E2EEnvelopeMetadata {
+            encrypted_key_b64,
+            nonce_b64,
+        })
     } else {
         None
     };
@@ -435,7 +458,9 @@ async fn admin_submission_detail(
 
 async fn admin_teacher_activity(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> AppResult<Json<TeacherActivityResponse>> {
+    let _token = authorize_admin(&state, &headers)?;
     let challenges = state
         .store
         .list_recent_challenges(10)?
@@ -487,13 +512,28 @@ async fn admin_cleanup(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> AppResult<Json<CleanupResponse>> {
-    let _token = authorize_teacher(&state, &headers)?;
+    let _token = authorize_admin(&state, &headers)?;
     let deleted_submission_ids = services::cleanup_expired_submissions(&state.store)?;
 
     Ok(Json(CleanupResponse {
         deleted_count: deleted_submission_ids.len(),
         deleted_submission_ids,
     }))
+}
+
+fn authorize_admin(state: &AppState, headers: &HeaderMap) -> AppResult<String> {
+    let token = bearer_token(headers)?;
+    let record = state
+        .store
+        .get_admin_token(&token)?
+        .ok_or_else(|| AppError::unauthorized("管理员访问令牌无效"))?;
+
+    let expires_at = services::parse_rfc3339(&record.expires_at)?;
+    if expires_at <= Utc::now() {
+        return Err(AppError::unauthorized("管理员访问令牌已过期"));
+    }
+
+    Ok(record.token)
 }
 
 fn authorize_teacher(state: &AppState, headers: &HeaderMap) -> AppResult<String> {
@@ -522,6 +562,57 @@ fn bearer_token(headers: &HeaderMap) -> AppResult<String> {
         .map(ToString::to_string)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| AppError::unauthorized("Authorization 头格式必须为 Bearer <token>"))
+}
+
+async fn build_download_response(
+    state: &AppState,
+    record: &crate::models::SubmissionRecord,
+    track_retrieval: bool,
+) -> AppResult<impl IntoResponse> {
+    if record.status == SubmissionStatus::Deleted {
+        return Err(AppError::not_found("提交内容已删除，无法下载"));
+    }
+
+    let download_path =
+        services::submission_download_path(&record.mode, Path::new(&record.storage_path));
+    let file = tokio::fs::File::open(&download_path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AppError::not_found("提交内容已删除或文件不存在")
+        } else {
+            AppError::internal(format!("打开下载文件失败: {error}"))
+        }
+    })?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| AppError::internal(format!("读取下载文件元数据失败: {error}")))?;
+
+    if track_retrieval {
+        let scheduled_delete_at = services::calculate_scheduled_delete_at(&state.config);
+        let retrieved_at = services::format_rfc3339(Utc::now());
+        let submission_ids = vec![record.submission_id.clone()];
+        state.store.schedule_submission_deletion(
+            &submission_ids,
+            &retrieved_at,
+            &scheduled_delete_at,
+        )?;
+    }
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    let download_name = services::submission_download_file_name(&record.mode, &record.file_name);
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, metadata.len().to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", download_name.replace('"', "_")),
+            ),
+        ],
+        body,
+    ))
 }
 
 fn build_items_response(
@@ -607,7 +698,9 @@ fn decode_b64_header(headers: &HeaderMap, header_name: &str) -> AppResult<String
 mod tests {
     use super::build_items_response;
     use crate::config::AppConfig;
-    use crate::models::{DownloadDescriptor, FetchItem, SubmissionMode, SubmissionRecord, SubmissionStatus};
+    use crate::models::{
+        DownloadDescriptor, FetchItem, SubmissionMode, SubmissionRecord, SubmissionStatus,
+    };
     use crate::storage::Store;
     use crate::AppState;
     use chrono::Utc;
@@ -616,9 +709,9 @@ mod tests {
 
     #[test]
     fn build_items_response_includes_e2e_download_metadata() {
-        let temp_dir = tempdir().expect("应该能创建临时目录");
+        let temp_dir = tempdir().expect("能创建临时目录");
         let data_dir = temp_dir.path().join("data");
-        std::fs::create_dir_all(data_dir.join("submissions/e2e")).expect("应该能创建目录");
+        std::fs::create_dir_all(data_dir.join("submissions/e2e")).expect("能创建目录");
         let storage_path = data_dir.join("submissions/e2e/sub-1.json");
         std::fs::write(
             &storage_path,
@@ -627,7 +720,7 @@ mod tests {
   "nonce_b64": "MTIzNDU2Nzg5MDEy"
 }"#,
         )
-        .expect("应该能写入元数据");
+        .expect("能写入元数据");
 
         let config = AppConfig {
             bind_addr: "127.0.0.1:0".to_string(),
@@ -636,13 +729,15 @@ mod tests {
             frontend_dist_dir: temp_dir.path().join("frontend-dist"),
             tls_cert_path: data_dir.join("tls/server-cert.pem"),
             tls_key_path: data_dir.join("tls/server-key.pem"),
+            admin_username: "admin".to_string(),
+            admin_password: "admin123".to_string(),
             challenge_ttl_secs: 300,
             token_ttl_secs: 1800,
             retrieval_delete_delay_secs: 3600,
         };
         let state = AppState {
             config: config.clone(),
-            store: Arc::new(Store::new(&config).expect("应该能创建存储")),
+            store: Arc::new(Store::new(&config).expect("能创建存储")),
         };
         let records = vec![SubmissionRecord {
             submission_id: "sub-1".to_string(),
@@ -660,7 +755,7 @@ mod tests {
             scheduled_delete_at: None,
         }];
 
-        let response = build_items_response(&state, &records).expect("应该能构建响应");
+        let response = build_items_response(&state, &records).expect("能构建响应");
         let item: &FetchItem = &response.items[0];
         match &item.download {
             DownloadDescriptor::E2e {

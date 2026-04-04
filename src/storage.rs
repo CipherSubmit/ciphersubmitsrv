@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    LinkInspectionRecord, SubmissionMode, SubmissionRecord, SubmissionStatus,
+    AdminTokenRecord, LinkInspectionRecord, SubmissionMode, SubmissionRecord, SubmissionStatus,
     TeacherChallengeRecord, TeacherTokenRecord,
 };
 
@@ -85,6 +85,13 @@ impl Store {
             issued_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             bound_public_key_fingerprint TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS admin_tokens (
+            token TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS retrieval_events (
@@ -316,6 +323,47 @@ impl Store {
             )
             .optional()
             .map_err(map_sqlite_error("读取访问令牌失败"))
+    }
+
+    pub fn insert_admin_token(&self, record: &AdminTokenRecord) -> AppResult<()> {
+        self.connection()?
+            .execute(
+                r#"
+                INSERT INTO admin_tokens (token, username, issued_at, expires_at)
+                VALUES (?1, ?2, ?3, ?4)
+                "#,
+                params![
+                    record.token,
+                    record.username,
+                    record.issued_at,
+                    record.expires_at,
+                ],
+            )
+            .map_err(map_sqlite_error("保存管理员访问令牌失败"))?;
+
+        Ok(())
+    }
+
+    pub fn get_admin_token(&self, token: &str) -> AppResult<Option<AdminTokenRecord>> {
+        self.connection()?
+            .query_row(
+                r#"
+                SELECT token, username, issued_at, expires_at
+                FROM admin_tokens
+                WHERE token = ?1
+                "#,
+                params![token],
+                |row| {
+                    Ok(AdminTokenRecord {
+                        token: row.get(0)?,
+                        username: row.get(1)?,
+                        issued_at: row.get(2)?,
+                        expires_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_error("读取管理员访问令牌失败"))
     }
 
     pub fn list_submissions(&self, studnum: Option<&str>) -> AppResult<Vec<SubmissionRecord>> {

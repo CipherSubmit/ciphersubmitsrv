@@ -2,12 +2,12 @@ use std::io::{Cursor, Write};
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
-use axum::http::{Request, StatusCode};
+use axum::http::{header, Request, StatusCode};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ciphersubmitsrv::api;
 use ciphersubmitsrv::config::AppConfig;
-use ciphersubmitsrv::models::Envelope;
+use ciphersubmitsrv::models::E2EEnvelopeMetadata;
 use ciphersubmitsrv::services;
 use ciphersubmitsrv::storage::Store;
 use ciphersubmitsrv::AppState;
@@ -46,6 +46,12 @@ struct VerifyResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct AdminLoginResponse {
+    access_token: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ItemsResponse {
     items: Vec<FetchItem>,
 }
@@ -74,11 +80,18 @@ struct SubmissionDetailResponse {
     submission_id: String,
     status: String,
     server_can_read_content: bool,
-    envelope: Option<Envelope>,
+    envelope: Option<E2EEnvelopeMetadata>,
+    retention: RetentionView,
+}
+
+#[derive(Debug, Deserialize)]
+struct RetentionView {
+    retrieved_at: Option<String>,
+    scheduled_delete_at: Option<String>,
 }
 
 fn test_config() -> (tempfile::TempDir, AppConfig) {
-    let temp_dir = tempdir().expect("应该能创建临时目录");
+    let temp_dir = tempdir().expect("能创建临时目录");
     let data_dir = temp_dir.path().join("data");
 
     let config = AppConfig {
@@ -88,6 +101,8 @@ fn test_config() -> (tempfile::TempDir, AppConfig) {
         frontend_dist_dir: temp_dir.path().join("frontend-dist"),
         tls_cert_path: data_dir.join("tls/server-cert.pem"),
         tls_key_path: data_dir.join("tls/server-key.pem"),
+        admin_username: "admin".to_string(),
+        admin_password: "admin123".to_string(),
         challenge_ttl_secs: 300,
         token_ttl_secs: 1800,
         retrieval_delete_delay_secs: 3600,
@@ -98,8 +113,8 @@ fn test_config() -> (tempfile::TempDir, AppConfig) {
 
 fn test_app() -> (tempfile::TempDir, axum::Router) {
     let (temp_dir, config) = test_config();
-    let store = Arc::new(Store::new(&config).expect("应该能创建测试存储"));
-    store.init_schema().expect("应该能初始化数据表");
+    let store = Arc::new(Store::new(&config).expect("能创建测试存储"));
+    store.init_schema().expect("能初始化数据表");
 
     let app = api::router(AppState { config, store });
     (temp_dir, app)
@@ -110,37 +125,34 @@ fn build_zip() -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(cursor);
     writer
         .start_file("homework.txt", SimpleFileOptions::default())
-        .expect("应该能创建 ZIP 条目");
+        .expect("能创建 ZIP 条目");
     writer
         .write_all(b"cipher submit integration test")
-        .expect("应该能写入 ZIP 内容");
+        .expect("能写入 ZIP 内容");
 
-    writer
-        .finish()
-        .expect("应该能完成 ZIP 写入")
-        .into_inner()
+    writer.finish().expect("能完成 ZIP 写入").into_inner()
 }
 
 async fn request_json<T: DeserializeOwned>(
     app: &axum::Router,
     request: Request<Body>,
 ) -> (StatusCode, T) {
-    let response = app.clone().oneshot(request).await.expect("请求应该成功执行");
+    let response = app.clone().oneshot(request).await.expect("请求成功执行");
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
-        .expect("应该能读取响应体");
-    let payload = serde_json::from_slice(&body).expect("响应体应该是合法 JSON");
+        .expect("能读取响应体");
+    let payload = serde_json::from_slice(&body).expect("响应体是合法 JSON");
     (status, payload)
 }
 
 async fn issue_teacher_token(app: &axum::Router) -> String {
     let mut rng = OsRng;
-    let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("应该能生成教师私钥");
+    let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("能生成教师私钥");
     let public_key_pem = private_key
         .to_public_key()
         .to_public_key_pem(LineEnding::LF)
-        .expect("应该能导出教师公钥");
+        .expect("能导出教师公钥");
 
     let challenge_request = Request::builder()
         .method("POST")
@@ -149,7 +161,7 @@ async fn issue_teacher_token(app: &axum::Router) -> String {
         .body(Body::from(
             json!({ "public_key_pem": public_key_pem }).to_string(),
         ))
-        .expect("应该能构造 challenge 请求");
+        .expect("能构造 challenge 请求");
 
     let (status, challenge): (StatusCode, ChallengeResponse) =
         request_json(app, challenge_request).await;
@@ -157,10 +169,10 @@ async fn issue_teacher_token(app: &axum::Router) -> String {
 
     let encrypted = STANDARD
         .decode(challenge.encrypted_challenge_b64)
-        .expect("challenge 密文应该是合法 base64");
+        .expect("challenge 密文是合法 base64");
     let plaintext = private_key
         .decrypt(Oaep::new::<Sha256>(), &encrypted)
-        .expect("应该能解密服务端 challenge");
+        .expect("能解密服务端 challenge");
 
     let verify_request = Request::builder()
         .method("POST")
@@ -174,11 +186,32 @@ async fn issue_teacher_token(app: &axum::Router) -> String {
             })
             .to_string(),
         ))
-        .expect("应该能构造 verify 请求");
+        .expect("能构造 verify 请求");
 
     let (status, verify): (StatusCode, VerifyResponse) = request_json(app, verify_request).await;
     assert_eq!(status, StatusCode::OK);
     verify.access_token
+}
+
+async fn issue_admin_token(app: &axum::Router) -> AdminLoginResponse {
+    let login_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/admin/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "username": "admin",
+                "password": "admin123",
+            })
+            .to_string(),
+        ))
+        .expect("能构造管理员登录请求");
+
+    let (status, response): (StatusCode, AdminLoginResponse) =
+        request_json(app, login_request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!response.expires_at.is_empty());
+    response
 }
 
 #[tokio::test]
@@ -195,7 +228,7 @@ async fn link_submission_auth_and_fetch_flow() {
         .header(HEADER_FILE_NAME_B64, STANDARD.encode("homework.zip"))
         .header(HEADER_FILE_SHA256, zip_sha256)
         .body(Body::from(zip_bytes.clone()))
-        .expect("应该能构造提交请求");
+        .expect("能构造提交请求");
 
     let (status, accepted): (StatusCode, SubmissionAcceptedResponse) =
         request_json(&app, submit_request).await;
@@ -208,7 +241,7 @@ async fn link_submission_auth_and_fetch_flow() {
         .uri("/api/v1/submissions/20260001")
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
-        .expect("应该能构造取件请求");
+        .expect("能构造取件请求");
 
     let (status, response): (StatusCode, ItemsResponse) = request_json(&app, fetch_request).await;
     assert_eq!(status, StatusCode::OK);
@@ -229,6 +262,7 @@ async fn link_submission_auth_and_fetch_flow() {
 #[tokio::test]
 async fn e2e_submission_is_visible_in_admin_detail() {
     let (_temp_dir, app) = test_app();
+    let admin = issue_admin_token(&app).await;
     let encrypted_key_b64 = STANDARD.encode(b"encrypted-key");
     let nonce_b64 = STANDARD.encode(b"123456789012");
     let ciphertext = b"ciphertext";
@@ -243,7 +277,7 @@ async fn e2e_submission_is_visible_in_admin_detail() {
         .header(HEADER_ENCRYPTED_KEY_B64, encrypted_key_b64)
         .header(HEADER_NONCE_B64, nonce_b64)
         .body(Body::from(ciphertext.as_slice().to_vec()))
-        .expect("应该能构造 e2e 提交请求");
+        .expect("能构造 e2e 提交请求");
 
     let (status, accepted): (StatusCode, SubmissionAcceptedResponse) =
         request_json(&app, submit_request).await;
@@ -251,9 +285,13 @@ async fn e2e_submission_is_visible_in_admin_detail() {
 
     let detail_request = Request::builder()
         .method("GET")
-        .uri(format!("/api/v1/admin/submissions/{}", accepted.submission_id))
+        .uri(format!(
+            "/api/v1/admin/submissions/{}",
+            accepted.submission_id
+        ))
+        .header("authorization", format!("Bearer {}", admin.access_token))
         .body(Body::empty())
-        .expect("应该能构造详情请求");
+        .expect("能构造详情请求");
 
     let (status, detail): (StatusCode, SubmissionDetailResponse) =
         request_json(&app, detail_request).await;
@@ -261,8 +299,9 @@ async fn e2e_submission_is_visible_in_admin_detail() {
     assert_eq!(detail.submission_id, accepted.submission_id);
     assert_eq!(detail.status, "ciphertext_only");
     assert!(!detail.server_can_read_content);
-    let envelope = detail.envelope.expect("应该包含 envelope");
-    assert_eq!(envelope.ciphertext_b64, STANDARD.encode(ciphertext));
+    let envelope = detail.envelope.expect("包含 envelope");
+    assert_eq!(envelope.encrypted_key_b64, STANDARD.encode(b"encrypted-key"));
+    assert_eq!(envelope.nonce_b64, STANDARD.encode(b"123456789012"));
 }
 
 #[tokio::test]
@@ -281,7 +320,7 @@ async fn fetch_list_returns_e2e_download_metadata() {
         .header(HEADER_ENCRYPTED_KEY_B64, encrypted_key_b64.clone())
         .header(HEADER_NONCE_B64, nonce_b64.clone())
         .body(Body::from(b"ciphertext".to_vec()))
-        .expect("应该能构造 e2e 提交请求");
+        .expect("能构造 e2e 提交请求");
 
     let (status, _accepted): (StatusCode, SubmissionAcceptedResponse) =
         request_json(&app, submit_request).await;
@@ -293,7 +332,7 @@ async fn fetch_list_returns_e2e_download_metadata() {
         .uri("/api/v1/submissions/20260002")
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
-        .expect("应该能构造取件请求");
+        .expect("能构造取件请求");
 
     let (status, response): (StatusCode, ItemsResponse) = request_json(&app, fetch_request).await;
     assert_eq!(status, StatusCode::OK);
@@ -307,4 +346,186 @@ async fn fetch_list_returns_e2e_download_metadata() {
         }
         DownloadDescriptor::Link => panic!("e2e 提交不应返回 link 下载描述"),
     }
+}
+
+#[tokio::test]
+async fn admin_endpoints_require_login() {
+    let (_temp_dir, app) = test_app();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/overview")
+                .body(Body::empty())
+                .expect("能构造 overview 请求"),
+        )
+        .await
+        .expect("请求成功执行");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_login_allows_overview_and_activity() {
+    let (_temp_dir, app) = test_app();
+    let admin = issue_admin_token(&app).await;
+
+    let overview_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/overview")
+                .header("authorization", format!("Bearer {}", admin.access_token))
+                .body(Body::empty())
+                .expect("能构造 overview 请求"),
+        )
+        .await
+        .expect("请求成功执行");
+    assert_eq!(overview_response.status(), StatusCode::OK);
+
+    let activity_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/auth/activity")
+                .header("authorization", format!("Bearer {}", admin.access_token))
+                .body(Body::empty())
+                .expect("能构造 activity 请求"),
+        )
+        .await
+        .expect("请求成功执行");
+    assert_eq!(activity_response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_downloads_link_payload_without_marking_retrieval() {
+    let (_temp_dir, app) = test_app();
+    let zip_bytes = build_zip();
+    let zip_sha256 = services::sha256_hex(&zip_bytes);
+
+    let submit_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/submissions/link")
+        .header(HEADER_NAME_B64, STANDARD.encode("Alice"))
+        .header(HEADER_STUDNUM_B64, STANDARD.encode("20260001"))
+        .header(HEADER_FILE_NAME_B64, STANDARD.encode("homework.zip"))
+        .header(HEADER_FILE_SHA256, zip_sha256)
+        .body(Body::from(zip_bytes.clone()))
+        .expect("能构造提交请求");
+
+    let (status, accepted): (StatusCode, SubmissionAcceptedResponse) =
+        request_json(&app, submit_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let admin = issue_admin_token(&app).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/admin/submissions/download/{}",
+                    accepted.submission_id
+                ))
+                .header("authorization", format!("Bearer {}", admin.access_token))
+                .body(Body::empty())
+                .expect("能构造管理员下载请求"),
+        )
+        .await
+        .expect("请求成功执行");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"homework.zip\"")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("能读取下载响应体");
+    assert_eq!(body.as_ref(), zip_bytes.as_slice());
+
+    let detail_request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/admin/submissions/{}", accepted.submission_id))
+        .header("authorization", format!("Bearer {}", admin.access_token))
+        .body(Body::empty())
+        .expect("能构造详情请求");
+    let (detail_status, detail): (StatusCode, SubmissionDetailResponse) =
+        request_json(&app, detail_request).await;
+    assert_eq!(detail_status, StatusCode::OK);
+    assert_eq!(detail.retention.retrieved_at, None);
+    assert_eq!(detail.retention.scheduled_delete_at, None);
+}
+
+#[tokio::test]
+async fn admin_downloads_e2e_ciphertext_without_marking_retrieval() {
+    let (_temp_dir, app) = test_app();
+    let encrypted_key_b64 = STANDARD.encode(b"encrypted-key");
+    let nonce_b64 = STANDARD.encode(b"123456789012");
+    let ciphertext = b"ciphertext";
+
+    let submit_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/submissions/e2e")
+        .header(HEADER_NAME_B64, STANDARD.encode("Bob"))
+        .header(HEADER_STUDNUM_B64, STANDARD.encode("20260002"))
+        .header(HEADER_FILE_NAME_B64, STANDARD.encode("target.zip"))
+        .header(HEADER_FILE_SHA256, "dummy-client-side-sha256")
+        .header(HEADER_ENCRYPTED_KEY_B64, encrypted_key_b64)
+        .header(HEADER_NONCE_B64, nonce_b64)
+        .body(Body::from(ciphertext.as_slice().to_vec()))
+        .expect("能构造 e2e 提交请求");
+
+    let (status, accepted): (StatusCode, SubmissionAcceptedResponse) =
+        request_json(&app, submit_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let admin = issue_admin_token(&app).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/admin/submissions/download/{}",
+                    accepted.submission_id
+                ))
+                .header("authorization", format!("Bearer {}", admin.access_token))
+                .body(Body::empty())
+                .expect("能构造管理员下载请求"),
+        )
+        .await
+        .expect("请求成功执行");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some("attachment; filename=\"target.bin\"")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("能读取下载响应体");
+    assert_eq!(body.as_ref(), ciphertext);
+
+    let detail_request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/admin/submissions/{}", accepted.submission_id))
+        .header("authorization", format!("Bearer {}", admin.access_token))
+        .body(Body::empty())
+        .expect("能构造详情请求");
+    let (detail_status, detail): (StatusCode, SubmissionDetailResponse) =
+        request_json(&app, detail_request).await;
+    assert_eq!(detail_status, StatusCode::OK);
+    assert_eq!(detail.retention.retrieved_at, None);
+    assert_eq!(detail.retention.scheduled_delete_at, None);
 }

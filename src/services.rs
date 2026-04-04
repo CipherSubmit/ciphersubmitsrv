@@ -19,8 +19,8 @@ use zip::ZipArchive;
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    Envelope, LinkInspectionRecord, SubmissionMode, SubmissionRecord, SubmissionStatus,
-    TeacherChallengeRecord, TeacherTokenRecord,
+    AdminTokenRecord, Envelope, LinkInspectionRecord, SubmissionMode, SubmissionRecord,
+    SubmissionStatus, TeacherChallengeRecord, TeacherTokenRecord,
 };
 use crate::storage::{remove_file_if_exists, Store};
 
@@ -324,6 +324,18 @@ pub fn build_teacher_token(fingerprint: String, config: &AppConfig) -> TeacherTo
     }
 }
 
+pub fn build_admin_token(username: &str, config: &AppConfig) -> AdminTokenRecord {
+    let issued_at = Utc::now();
+    let expires_at = issued_at + Duration::seconds(config.token_ttl_secs);
+
+    AdminTokenRecord {
+        token: generate_token(),
+        username: username.to_string(),
+        issued_at: format_rfc3339(issued_at),
+        expires_at: format_rfc3339(expires_at),
+    }
+}
+
 pub fn generate_random_challenge() -> Vec<u8> {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -353,6 +365,23 @@ pub fn submission_download_path(mode: &SubmissionMode, storage_path: &Path) -> P
     match mode {
         SubmissionMode::Link => storage_path.to_path_buf(),
         SubmissionMode::E2e => e2e_ciphertext_path(storage_path),
+    }
+}
+
+pub fn submission_download_file_name(mode: &SubmissionMode, original_file_name: &str) -> String {
+    match mode {
+        SubmissionMode::Link => original_file_name.to_string(),
+        SubmissionMode::E2e => {
+            let path = Path::new(original_file_name);
+            if path.extension().and_then(|value| value.to_str()) == Some("bin") {
+                return original_file_name.to_string();
+            }
+
+            match path.file_stem().and_then(|value| value.to_str()) {
+                Some(stem) if !stem.is_empty() => format!("{stem}.bin"),
+                _ => format!("{original_file_name}.bin"),
+            }
+        }
     }
 }
 
@@ -409,8 +438,8 @@ async fn stream_body_to_file(path: &Path, body: Body) -> AppResult<String> {
     let mut hasher = Sha256::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|error| AppError::bad_request(format!("读取请求体失败: {error}")))?;
+        let chunk =
+            chunk.map_err(|error| AppError::bad_request(format!("读取请求体失败: {error}")))?;
         if chunk.is_empty() {
             continue;
         }
@@ -473,7 +502,7 @@ fn is_git_trace(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_git_trace, sha256_hex};
+    use super::{is_git_trace, sha256_hex, submission_download_file_name};
     use rsa::pkcs8::{EncodePublicKey, LineEnding};
     use rsa::rand_core::OsRng;
     use rsa::{Oaep, RsaPrivateKey};
@@ -499,18 +528,30 @@ mod tests {
     #[test]
     fn challenge_encryption_is_cli_compatible() {
         let mut rng = OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("应该能生成测试私钥");
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("能生成测试私钥");
         let public_key_pem = private_key
             .to_public_key()
             .to_public_key_pem(LineEnding::LF)
-            .expect("应该能导出测试公钥");
+            .expect("能导出测试公钥");
         let challenge = b"cipher-submit-test-challenge";
 
-        let encrypted = encrypt_challenge(&public_key_pem, challenge).expect("应该能加密挑战");
+        let encrypted = encrypt_challenge(&public_key_pem, challenge).expect("能加密挑战");
         let decrypted = private_key
             .decrypt(Oaep::new::<Sha256>(), &encrypted)
-            .expect("客户端应该能用 OAEP-SHA256 解密 challenge");
+            .expect("客户端能用 OAEP-SHA256 解密 challenge");
 
         assert_eq!(decrypted, challenge);
+    }
+
+    #[test]
+    fn submission_download_file_name_matches_mode() {
+        assert_eq!(
+            submission_download_file_name(&crate::models::SubmissionMode::Link, "target.zip"),
+            "target.zip"
+        );
+        assert_eq!(
+            submission_download_file_name(&crate::models::SubmissionMode::E2e, "target.zip"),
+            "target.bin"
+        );
     }
 }
