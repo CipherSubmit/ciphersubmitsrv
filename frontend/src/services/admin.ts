@@ -1,10 +1,10 @@
 import { http } from '@/services/http'
 import type {
-    AdminLoginResponse,
-    CleanupResponse,
-    SubmissionDetailResponse,
-    SubmissionOverviewItem,
-    TeacherActivityResponse,
+  AdminLoginResponse,
+  CleanupResponse,
+  SubmissionDetailResponse,
+  SubmissionOverviewItem,
+  TeacherActivityResponse,
 } from '@/types/admin'
 
 export async function loginAdmin(username: string, password: string) {
@@ -21,7 +21,9 @@ export async function fetchOverview() {
 }
 
 export async function fetchSubmissionDetail(submissionId: string) {
-  const { data } = await http.get<SubmissionDetailResponse>(`/api/v1/admin/submissions/${submissionId}`)
+  const { data } = await http.get<SubmissionDetailResponse>(
+    `/api/v1/admin/submissions/${submissionId}`,
+  )
   return data
 }
 

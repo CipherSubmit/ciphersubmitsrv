@@ -54,7 +54,9 @@ onMounted(loadPolicy)
       <div>
         <p class="m-0 text-[0.8rem] uppercase tracking-[0.16em] text-blue-600">Maintenance</p>
         <h2 class="my-2 font-['Manrope'] text-[2rem] text-slate-950">维护与清理</h2>
-        <p class="m-0 leading-7 text-slate-600">这里把演示环境默认登录信息、当前 API 连接位置和延迟删除策略集中展示。</p>
+        <p class="m-0 leading-7 text-slate-600">
+          这里把演示环境默认登录信息、当前 API 连接位置和延迟删除策略集中展示。
+        </p>
       </div>
     </header>
 
@@ -87,7 +89,9 @@ onMounted(loadPolicy)
       <NSpace vertical>
         <span>该操作会删除已经超过保留期的提交负载，并将数据库状态更新为 deleted。</span>
         <NButton type="primary" :loading="cleanupLoading" @click="handleCleanup">立即清理</NButton>
-        <NAlert v-if="cleanupMessage" type="success" :show-icon="false">{{ cleanupMessage }}</NAlert>
+        <NAlert v-if="cleanupMessage" type="success" :show-icon="false">{{
+          cleanupMessage
+        }}</NAlert>
         <NAlert v-if="errorMessage" type="error" :show-icon="false">{{ errorMessage }}</NAlert>
       </NSpace>
     </NCard>

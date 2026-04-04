@@ -57,9 +57,8 @@ export function getApiBaseLabel(): string {
 
 export function normalizeApiError(error: unknown): string {
   if (axios.isAxiosError(error)) {
-    const bodyMessage = typeof error.response?.data === 'string'
-      ? error.response.data
-      : error.response?.data?.message
+    const bodyMessage =
+      typeof error.response?.data === 'string' ? error.response.data : error.response?.data?.message
 
     return bodyMessage || error.message || '请求失败'
   }

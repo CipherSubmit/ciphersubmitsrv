@@ -15,9 +15,24 @@ const metrics = computed(() => {
   const value = activity.value
 
   return [
-    { title: '最近挑战', value: value?.recent_challenges.length ?? 0, hint: '教师挑战发放记录', tone: 'blue' as const },
-    { title: '最近令牌', value: value?.recent_tokens.length ?? 0, hint: '教师认证后签发令牌', tone: 'green' as const },
-    { title: '最近取件', value: value?.recent_retrievals.length ?? 0, hint: '下载与延迟删除记录', tone: 'amber' as const },
+    {
+      title: '最近挑战',
+      value: value?.recent_challenges.length ?? 0,
+      hint: '教师挑战发放记录',
+      tone: 'blue' as const,
+    },
+    {
+      title: '最近令牌',
+      value: value?.recent_tokens.length ?? 0,
+      hint: '教师认证后签发令牌',
+      tone: 'green' as const,
+    },
+    {
+      title: '最近取件',
+      value: value?.recent_retrievals.length ?? 0,
+      hint: '下载与延迟删除记录',
+      tone: 'amber' as const,
+    },
   ]
 })
 
@@ -43,7 +58,9 @@ onMounted(loadActivity)
       <div>
         <p class="m-0 text-[0.8rem] uppercase tracking-[0.16em] text-blue-600">Activity</p>
         <h2 class="my-2 font-['Manrope'] text-[2rem] text-slate-950">教师活动</h2>
-        <p class="m-0 leading-7 text-slate-600">把 challenge、token 和 retrieval 拆开看，方便定位当前认证与取件节奏。</p>
+        <p class="m-0 leading-7 text-slate-600">
+          把 challenge、token 和 retrieval 拆开看，方便定位当前认证与取件节奏。
+        </p>
       </div>
       <NButton type="primary" :loading="loading" @click="loadActivity">刷新活动</NButton>
     </header>
@@ -60,7 +77,8 @@ onMounted(loadActivity)
     </section>
 
     <NAlert v-if="activity" type="info" :show-icon="false">
-      保留策略：{{ activity.retention_policy.strategy }}，删除延迟 {{ activity.retention_policy.delete_delay_seconds }} 秒。
+      保留策略：{{ activity.retention_policy.strategy }}，删除延迟
+      {{ activity.retention_policy.delete_delay_seconds }} 秒。
     </NAlert>
 
     <NAlert v-if="errorMessage" type="error" :show-icon="false">
@@ -77,7 +95,9 @@ onMounted(loadActivity)
                 <p>{{ item.public_key_fingerprint }}</p>
               </div>
               <div class="list-meta">
-                <NTag :type="item.used ? 'success' : 'warning'" :bordered="false">{{ item.used ? '已使用' : '未使用' }}</NTag>
+                <NTag :type="item.used ? 'success' : 'warning'" :bordered="false">{{
+                  item.used ? '已使用' : '未使用'
+                }}</NTag>
                 <span>{{ item.created_at }}</span>
               </div>
             </div>
@@ -87,7 +107,10 @@ onMounted(loadActivity)
 
       <NCard title="最近 Token">
         <NList bordered>
-          <NListItem v-for="item in activity.recent_tokens" :key="`${item.issued_at}-${item.bound_public_key_fingerprint}`">
+          <NListItem
+            v-for="item in activity.recent_tokens"
+            :key="`${item.issued_at}-${item.bound_public_key_fingerprint}`"
+          >
             <div class="list-row">
               <div>
                 <strong>{{ item.issued_at }}</strong>
@@ -105,7 +128,10 @@ onMounted(loadActivity)
     <NCard v-if="activity" title="最近取件">
       <NEmpty v-if="activity.recent_retrievals.length === 0" description="暂时没有取件记录" />
       <NList v-else bordered>
-        <NListItem v-for="item in activity.recent_retrievals" :key="`${item.submission_id}-${item.retrieved_at}`">
+        <NListItem
+          v-for="item in activity.recent_retrievals"
+          :key="`${item.submission_id}-${item.retrieved_at}`"
+        >
           <div class="list-row">
             <div>
               <strong>{{ item.submission_id }}</strong>

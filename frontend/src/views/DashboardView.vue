@@ -1,23 +1,23 @@
 <script setup lang="ts">
 import {
-    NAlert,
-    NButton,
-    NCard,
-    NCode,
-    NDataTable,
-    NDescriptions,
-    NDescriptionsItem,
-    NDrawer,
-    NDrawerContent,
-    NInput,
-    NList,
-    NListItem,
-    NSelect,
-    NSpace,
-    NSpin,
-    NTag,
-    useMessage,
-    type DataTableColumns,
+  NAlert,
+  NButton,
+  NCard,
+  NCode,
+  NDataTable,
+  NDescriptions,
+  NDescriptionsItem,
+  NDrawer,
+  NDrawerContent,
+  NInput,
+  NList,
+  NListItem,
+  NSelect,
+  NSpace,
+  NSpin,
+  NTag,
+  useMessage,
+  type DataTableColumns,
 } from 'naive-ui'
 import { computed, h, onMounted, ref } from 'vue'
 
@@ -44,11 +44,13 @@ const modeOptions = [
   { label: '端到端模式', value: 'e2e' },
 ]
 
-const filteredRows = computed(() => rows.value.filter((item) => {
-  const byStudnum = !studnumFilter.value || item.studnum.includes(studnumFilter.value.trim())
-  const byMode = modeFilter.value === 'all' || item.mode === modeFilter.value
-  return byStudnum && byMode
-}))
+const filteredRows = computed(() =>
+  rows.value.filter((item) => {
+    const byStudnum = !studnumFilter.value || item.studnum.includes(studnumFilter.value.trim())
+    const byMode = modeFilter.value === 'all' || item.mode === modeFilter.value
+    return byStudnum && byMode
+  }),
+)
 
 const metrics = computed(() => {
   const total = rows.value.length
@@ -59,7 +61,12 @@ const metrics = computed(() => {
   return [
     { title: '总提交数', value: total, hint: '当前数据库中的有效记录', tone: 'blue' as const },
     { title: '链路模式', value: linkCount, hint: '服务端可读取 ZIP 内容', tone: 'green' as const },
-    { title: '端到端模式', value: e2eCount, hint: '服务端仅存密文与元数据', tone: 'amber' as const },
+    {
+      title: '端到端模式',
+      value: e2eCount,
+      hint: '服务端仅存密文与元数据',
+      tone: 'amber' as const,
+    },
     { title: '待删除', value: scheduledDelete, hint: '已取件且等待清理', tone: 'slate' as const },
   ]
 })
@@ -73,11 +80,12 @@ const columns: DataTableColumns<SubmissionOverviewItem> = [
     title: '模式',
     key: 'mode',
     width: 120,
-    render: (row) => h(
-      NTag,
-      { type: row.mode === 'e2e' ? 'warning' : 'success', bordered: false, round: true },
-      { default: () => row.mode.toUpperCase() },
-    ),
+    render: (row) =>
+      h(
+        NTag,
+        { type: row.mode === 'e2e' ? 'warning' : 'success', bordered: false, round: true },
+        { default: () => row.mode.toUpperCase() },
+      ),
   },
   {
     title: '状态',
@@ -90,11 +98,12 @@ const columns: DataTableColumns<SubmissionOverviewItem> = [
     title: '操作',
     key: 'actions',
     width: 110,
-    render: (row) => h(
-      NButton,
-      { tertiary: true, type: 'primary', onClick: () => openDetail(row.submission_id) },
-      { default: () => '查看' },
-    ),
+    render: (row) =>
+      h(
+        NButton,
+        { tertiary: true, type: 'primary', onClick: () => openDetail(row.submission_id) },
+        { default: () => '查看' },
+      ),
   },
 ]
 
@@ -177,7 +186,9 @@ onMounted(loadOverview)
       <div>
         <p class="m-0 text-[0.8rem] uppercase tracking-[0.16em] text-blue-600">Overview</p>
         <h2 class="my-2 font-['Manrope'] text-[2rem] text-slate-950">提交总览</h2>
-        <p class="m-0 max-w-[70ch] leading-7 text-slate-600">列表、模式、状态和明密文边界放在一个入口里查看，减少页面的信息散射。</p>
+        <p class="m-0 max-w-[70ch] leading-7 text-slate-600">
+          列表、模式、状态和明密文边界放在一个入口里查看，减少页面的信息散射。
+        </p>
       </div>
       <NButton type="primary" :loading="loading" @click="loadOverview">刷新数据</NButton>
     </header>
@@ -226,35 +237,62 @@ onMounted(loadOverview)
           <template v-if="selectedDetail">
             <div class="detail-stack">
               <div class="flex justify-end">
-                <NButton type="primary" secondary :loading="downloadLoading" @click="handleDownload">
+                <NButton
+                  type="primary"
+                  secondary
+                  :loading="downloadLoading"
+                  @click="handleDownload"
+                >
                   直接下载
                 </NButton>
               </div>
 
               <NCard size="small">
                 <NDescriptions bordered label-placement="left" :column="1">
-                  <NDescriptionsItem label="提交编号">{{ selectedDetail.submission_id }}</NDescriptionsItem>
+                  <NDescriptionsItem label="提交编号">{{
+                    selectedDetail.submission_id
+                  }}</NDescriptionsItem>
                   <NDescriptionsItem label="姓名">{{ selectedDetail.name }}</NDescriptionsItem>
                   <NDescriptionsItem label="学号">{{ selectedDetail.studnum }}</NDescriptionsItem>
-                  <NDescriptionsItem label="文件名">{{ selectedDetail.file_name }}</NDescriptionsItem>
+                  <NDescriptionsItem label="文件名">{{
+                    selectedDetail.file_name
+                  }}</NDescriptionsItem>
                   <NDescriptionsItem label="模式">{{ selectedDetail.mode }}</NDescriptionsItem>
                   <NDescriptionsItem label="状态">{{ selectedDetail.status }}</NDescriptionsItem>
-                  <NDescriptionsItem label="时间">{{ selectedDetail.accepted_at }}</NDescriptionsItem>
+                  <NDescriptionsItem label="时间">{{
+                    selectedDetail.accepted_at
+                  }}</NDescriptionsItem>
                 </NDescriptions>
               </NCard>
 
               <NCard size="small" title="可见性边界">
-                <NAlert :type="selectedDetail.server_can_read_content ? 'warning' : 'success'" :show-icon="false">
-                  {{ selectedDetail.server_can_read_content ? '当前为链路模式，服务端可读取 ZIP 内容。' : '当前为端到端模式，服务端只可见 envelope 元数据。' }}
+                <NAlert
+                  :type="selectedDetail.server_can_read_content ? 'warning' : 'success'"
+                  :show-icon="false"
+                >
+                  {{
+                    selectedDetail.server_can_read_content
+                      ? '当前为链路模式，服务端可读取 ZIP 内容。'
+                      : '当前为端到端模式，服务端只可见 envelope 元数据。'
+                  }}
                 </NAlert>
               </NCard>
 
               <NCard v-if="selectedDetail.inspection" size="small" title="链路模式检查结果">
                 <NSpace vertical>
-                  <span>发现 .git 痕迹：{{ selectedDetail.inspection.has_git_dir ? '是' : '否' }}</span>
-                  <span>重复提交数：{{ selectedDetail.inspection.duplicate_submission_ids.length }}</span>
+                  <span
+                    >发现 .git 痕迹：{{ selectedDetail.inspection.has_git_dir ? '是' : '否' }}</span
+                  >
+                  <span
+                    >重复提交数：{{
+                      selectedDetail.inspection.duplicate_submission_ids.length
+                    }}</span
+                  >
                   <NList bordered>
-                    <NListItem v-for="entry in selectedDetail.inspection.zip_entries_summary" :key="entry">
+                    <NListItem
+                      v-for="entry in selectedDetail.inspection.zip_entries_summary"
+                      :key="entry"
+                    >
                       {{ entry }}
                     </NListItem>
                   </NList>

@@ -38,10 +38,18 @@ async function handleLogin() {
 </script>
 
 <template>
-  <main class="grid min-h-[100dvh] gap-10 bg-slate-100 px-6 py-8 lg:grid-cols-[minmax(0,1.15fr)_minmax(360px,440px)] lg:items-center lg:px-12">
+  <main
+    class="grid min-h-[100dvh] gap-10 bg-slate-100 px-6 py-8 lg:grid-cols-[minmax(0,1.15fr)_minmax(360px,440px)] lg:items-center lg:px-12"
+  >
     <section class="max-w-[640px]">
-      <p class="mb-2.5 inline-block text-[0.82rem] uppercase tracking-[0.18em] text-blue-600">Vue Naive Admin Style</p>
-      <h1 class="m-0 font-['Manrope'] text-[clamp(2.8rem,5vw,4.6rem)] leading-[0.96] text-slate-950">更简洁的 CipherSubmit 管理入口。</h1>
+      <p class="mb-2.5 inline-block text-[0.82rem] uppercase tracking-[0.18em] text-blue-600">
+        Vue Naive Admin Style
+      </p>
+      <h1
+        class="m-0 font-['Manrope'] text-[clamp(2.8rem,5vw,4.6rem)] leading-[0.96] text-slate-950"
+      >
+        更简洁的 CipherSubmit 管理入口。
+      </h1>
       <p class="mt-[18px] max-w-[56ch] text-[1.02rem] leading-8 text-slate-600">
         这里默认面向开发和演示环境，启动后可直接使用预填的管理员账号密码登录；生产环境请覆盖服务端环境变量。
       </p>
@@ -50,7 +58,9 @@ async function handleLogin() {
     <NCard class="rounded-[28px] shadow-[0_24px_60px_rgba(15,23,42,0.12)]" :bordered="false">
       <template #header>
         <div class="grid gap-1.5">
-          <span class="inline-block text-[0.82rem] uppercase tracking-[0.18em] text-blue-600">Admin Login</span>
+          <span class="inline-block text-[0.82rem] uppercase tracking-[0.18em] text-blue-600"
+            >Admin Login</span
+          >
           <strong class="font-['Manrope'] text-[1.8rem] text-slate-950">登录后台控制台</strong>
         </div>
       </template>

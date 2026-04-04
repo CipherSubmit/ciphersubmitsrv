@@ -1,5 +1,12 @@
 <script setup lang="ts">
-import { darkTheme, dateZhCN, NConfigProvider, NDialogProvider, NMessageProvider, zhCN } from 'naive-ui';
+import {
+  darkTheme,
+  dateZhCN,
+  NConfigProvider,
+  NDialogProvider,
+  NMessageProvider,
+  zhCN,
+} from 'naive-ui'
 
 const themeOverrides = {
   common: {
