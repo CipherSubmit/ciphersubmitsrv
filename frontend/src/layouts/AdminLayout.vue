@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import {
-  NButton,
-  NLayout,
-  NLayoutContent,
-  NLayoutHeader,
-  NLayoutSider,
-  NMenu,
-  NTag,
+    NButton,
+    NLayout,
+    NLayoutContent,
+    NLayoutHeader,
+    NLayoutSider,
+    NMenu,
+    NTag,
 } from 'naive-ui'
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -20,6 +20,7 @@ const authStore = useAuthStore()
 const menuOptions = [
   { label: '提交总览', key: '/dashboard/overview' },
   { label: '教师活动', key: '/dashboard/activity' },
+  { label: '教师白名单', key: '/dashboard/teacher-keys' },
   { label: '维护操作', key: '/dashboard/maintenance' },
 ]
 

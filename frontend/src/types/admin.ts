@@ -89,3 +89,8 @@ export interface CleanupResponse {
   deleted_submission_ids: string[]
   deleted_count: number
 }
+
+export interface AuthorizedTeacherKeyView {
+  fingerprint: string
+  file_name: string
+}

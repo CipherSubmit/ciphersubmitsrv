@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub frontend_dist_dir: PathBuf,
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
+    pub authorized_teacher_keys_dir: PathBuf,
     pub admin_username: String,
     pub admin_password: String,
     pub challenge_ttl_secs: i64,
@@ -29,6 +30,14 @@ impl AppConfig {
         let tls_dir = data_dir.join("tls");
         fs::create_dir_all(&tls_dir)
             .map_err(|error| AppError::internal(format!("创建 TLS 目录失败: {error}")))?;
+
+        let authorized_teacher_keys_dir = PathBuf::from(
+            env::var("CISUB_TEACHER_KEYS_DIR")
+                .unwrap_or_else(|_| data_dir.join("teacher_keys").display().to_string()),
+        );
+        fs::create_dir_all(&authorized_teacher_keys_dir).map_err(|error| {
+            AppError::internal(format!("创建教师公钥目录失败: {error}"))
+        })?;
 
         Ok(Self {
             bind_addr: env::var("CISUB_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8443".to_string()),
@@ -54,6 +63,7 @@ impl AppConfig {
                 env::var("CISUB_TLS_KEY")
                     .unwrap_or_else(|_| tls_dir.join("server-key.pem").display().to_string()),
             ),
+            authorized_teacher_keys_dir,
             admin_username: env::var("CISUB_ADMIN_USERNAME")
                 .unwrap_or_else(|_| "admin".to_string()),
             admin_password: env::var("CISUB_ADMIN_PASSWORD")

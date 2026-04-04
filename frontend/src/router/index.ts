@@ -28,6 +28,11 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/ActivityView.vue'),
       },
       {
+        path: '/dashboard/teacher-keys',
+        name: 'teacher-keys',
+        component: () => import('@/views/TeacherKeysView.vue'),
+      },
+      {
         path: '/dashboard/maintenance',
         name: 'maintenance',
         component: () => import('@/views/MaintenanceView.vue'),

@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
@@ -7,7 +8,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ciphersubmitsrv::api;
 use ciphersubmitsrv::config::AppConfig;
-use ciphersubmitsrv::models::E2EEnvelopeMetadata;
+use ciphersubmitsrv::models::{AuthorizedTeacherKeyView, E2EEnvelopeMetadata};
 use ciphersubmitsrv::services;
 use ciphersubmitsrv::storage::Store;
 use ciphersubmitsrv::AppState;
@@ -49,6 +50,12 @@ struct VerifyResponse {
 struct AdminLoginResponse {
     access_token: String,
     expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TeacherKeysResponseItem {
+    fingerprint: String,
+    file_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +108,7 @@ fn test_config() -> (tempfile::TempDir, AppConfig) {
         frontend_dist_dir: temp_dir.path().join("frontend-dist"),
         tls_cert_path: data_dir.join("tls/server-cert.pem"),
         tls_key_path: data_dir.join("tls/server-key.pem"),
+        authorized_teacher_keys_dir: data_dir.join("teacher_keys"),
         admin_username: "admin".to_string(),
         admin_password: "admin123".to_string(),
         challenge_ttl_secs: 300,
@@ -111,13 +119,25 @@ fn test_config() -> (tempfile::TempDir, AppConfig) {
     (temp_dir, config)
 }
 
-fn test_app() -> (tempfile::TempDir, axum::Router) {
+fn test_app() -> (tempfile::TempDir, AppConfig, axum::Router) {
     let (temp_dir, config) = test_config();
     let store = Arc::new(Store::new(&config).expect("能创建测试存储"));
     store.init_schema().expect("能初始化数据表");
 
-    let app = api::router(AppState { config, store });
-    (temp_dir, app)
+    let app = api::router(AppState {
+        config: config.clone(),
+        store,
+    });
+    (temp_dir, config, app)
+}
+
+fn authorize_teacher_key(config: &AppConfig, public_key_pem: &str) {
+    fs::create_dir_all(&config.authorized_teacher_keys_dir).expect("能创建教师公钥目录");
+    fs::write(
+        config.authorized_teacher_keys_dir.join("teacher-test.pem"),
+        public_key_pem,
+    )
+    .expect("能写入授权教师公钥");
 }
 
 fn build_zip() -> Vec<u8> {
@@ -146,13 +166,15 @@ async fn request_json<T: DeserializeOwned>(
     (status, payload)
 }
 
-async fn issue_teacher_token(app: &axum::Router) -> String {
+async fn issue_teacher_token(app: &axum::Router, config: &AppConfig) -> String {
     let mut rng = OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("能生成教师私钥");
     let public_key_pem = private_key
         .to_public_key()
         .to_public_key_pem(LineEnding::LF)
         .expect("能导出教师公钥");
+
+    authorize_teacher_key(config, &public_key_pem);
 
     let challenge_request = Request::builder()
         .method("POST")
@@ -216,7 +238,7 @@ async fn issue_admin_token(app: &axum::Router) -> AdminLoginResponse {
 
 #[tokio::test]
 async fn link_submission_auth_and_fetch_flow() {
-    let (_temp_dir, app) = test_app();
+    let (_temp_dir, config, app) = test_app();
     let zip_bytes = build_zip();
     let zip_sha256 = services::sha256_hex(&zip_bytes);
 
@@ -235,7 +257,7 @@ async fn link_submission_auth_and_fetch_flow() {
     assert_eq!(status, StatusCode::OK);
     assert!(accepted.submission_id.starts_with("sub-"));
 
-    let token = issue_teacher_token(&app).await;
+    let token = issue_teacher_token(&app, &config).await;
     let fetch_request = Request::builder()
         .method("GET")
         .uri("/api/v1/submissions/20260001")
@@ -261,7 +283,7 @@ async fn link_submission_auth_and_fetch_flow() {
 
 #[tokio::test]
 async fn e2e_submission_is_visible_in_admin_detail() {
-    let (_temp_dir, app) = test_app();
+    let (_temp_dir, _config, app) = test_app();
     let admin = issue_admin_token(&app).await;
     let encrypted_key_b64 = STANDARD.encode(b"encrypted-key");
     let nonce_b64 = STANDARD.encode(b"123456789012");
@@ -306,7 +328,7 @@ async fn e2e_submission_is_visible_in_admin_detail() {
 
 #[tokio::test]
 async fn fetch_list_returns_e2e_download_metadata() {
-    let (_temp_dir, app) = test_app();
+    let (_temp_dir, config, app) = test_app();
     let encrypted_key_b64 = STANDARD.encode(b"encrypted-key");
     let nonce_b64 = STANDARD.encode(b"123456789012");
 
@@ -326,7 +348,7 @@ async fn fetch_list_returns_e2e_download_metadata() {
         request_json(&app, submit_request).await;
     assert_eq!(status, StatusCode::OK);
 
-    let token = issue_teacher_token(&app).await;
+    let token = issue_teacher_token(&app, &config).await;
     let fetch_request = Request::builder()
         .method("GET")
         .uri("/api/v1/submissions/20260002")
@@ -350,7 +372,7 @@ async fn fetch_list_returns_e2e_download_metadata() {
 
 #[tokio::test]
 async fn admin_endpoints_require_login() {
-    let (_temp_dir, app) = test_app();
+    let (_temp_dir, _config, app) = test_app();
 
     let response = app
         .clone()
@@ -369,7 +391,7 @@ async fn admin_endpoints_require_login() {
 
 #[tokio::test]
 async fn admin_login_allows_overview_and_activity() {
-    let (_temp_dir, app) = test_app();
+    let (_temp_dir, _config, app) = test_app();
     let admin = issue_admin_token(&app).await;
 
     let overview_response = app
@@ -402,8 +424,72 @@ async fn admin_login_allows_overview_and_activity() {
 }
 
 #[tokio::test]
+async fn admin_can_manage_teacher_key_whitelist() {
+    let (_temp_dir, _config, app) = test_app();
+    let admin = issue_admin_token(&app).await;
+    let mut rng = OsRng;
+    let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("能生成教师私钥");
+    let public_key_pem = private_key
+        .to_public_key()
+        .to_public_key_pem(LineEnding::LF)
+        .expect("能导出教师公钥");
+    let expected_fingerprint = services::public_key_fingerprint(&public_key_pem)
+        .expect("能计算教师公钥指纹");
+
+    let add_request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/admin/teacher-keys")
+        .header("authorization", format!("Bearer {}", admin.access_token))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "public_key_pem": public_key_pem }).to_string(),
+        ))
+        .expect("能构造添加白名单请求");
+    let (add_status, added): (StatusCode, AuthorizedTeacherKeyView) =
+        request_json(&app, add_request).await;
+    assert_eq!(add_status, StatusCode::OK);
+    assert_eq!(added.fingerprint, expected_fingerprint);
+    assert!(added.file_name.ends_with(".pem"));
+
+    let list_request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/admin/teacher-keys")
+        .header("authorization", format!("Bearer {}", admin.access_token))
+        .body(Body::empty())
+        .expect("能构造白名单列表请求");
+    let (list_status, items): (StatusCode, Vec<TeacherKeysResponseItem>) =
+        request_json(&app, list_request).await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].fingerprint, expected_fingerprint);
+    assert_eq!(items[0].file_name, added.file_name);
+
+    let delete_request = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/v1/admin/teacher-keys/{}", expected_fingerprint))
+        .header("authorization", format!("Bearer {}", admin.access_token))
+        .body(Body::empty())
+        .expect("能构造删除白名单请求");
+    let (delete_status, deleted): (StatusCode, AuthorizedTeacherKeyView) =
+        request_json(&app, delete_request).await;
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(deleted.fingerprint, expected_fingerprint);
+
+    let list_request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/admin/teacher-keys")
+        .header("authorization", format!("Bearer {}", admin.access_token))
+        .body(Body::empty())
+        .expect("能构造白名单列表请求");
+    let (list_status, items): (StatusCode, Vec<TeacherKeysResponseItem>) =
+        request_json(&app, list_request).await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
 async fn admin_downloads_link_payload_without_marking_retrieval() {
-    let (_temp_dir, app) = test_app();
+    let (_temp_dir, _config, app) = test_app();
     let zip_bytes = build_zip();
     let zip_sha256 = services::sha256_hex(&zip_bytes);
 
@@ -466,7 +552,7 @@ async fn admin_downloads_link_payload_without_marking_retrieval() {
 
 #[tokio::test]
 async fn admin_downloads_e2e_ciphertext_without_marking_retrieval() {
-    let (_temp_dir, app) = test_app();
+    let (_temp_dir, _config, app) = test_app();
     let encrypted_key_b64 = STANDARD.encode(b"encrypted-key");
     let nonce_b64 = STANDARD.encode(b"123456789012");
     let ciphertext = b"ciphertext";
@@ -528,4 +614,32 @@ async fn admin_downloads_e2e_ciphertext_without_marking_retrieval() {
     assert_eq!(detail_status, StatusCode::OK);
     assert_eq!(detail.retention.retrieved_at, None);
     assert_eq!(detail.retention.scheduled_delete_at, None);
+}
+
+#[tokio::test]
+async fn unauthorized_teacher_key_is_rejected_before_challenge() {
+    let (_temp_dir, _config, app) = test_app();
+    let mut rng = OsRng;
+    let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("能生成教师私钥");
+    let public_key_pem = private_key
+        .to_public_key()
+        .to_public_key_pem(LineEnding::LF)
+        .expect("能导出教师公钥");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/teacher/challenge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "public_key_pem": public_key_pem }).to_string(),
+                ))
+                .expect("能构造 challenge 请求"),
+        )
+        .await
+        .expect("请求成功执行");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }

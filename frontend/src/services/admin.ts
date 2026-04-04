@@ -1,10 +1,11 @@
 import { http } from '@/services/http'
 import type {
-  AdminLoginResponse,
-  CleanupResponse,
-  SubmissionDetailResponse,
-  SubmissionOverviewItem,
-  TeacherActivityResponse,
+    AdminLoginResponse,
+    AuthorizedTeacherKeyView,
+    CleanupResponse,
+    SubmissionDetailResponse,
+    SubmissionOverviewItem,
+    TeacherActivityResponse,
 } from '@/types/admin'
 
 export async function loginAdmin(username: string, password: string) {
@@ -36,6 +37,25 @@ export async function downloadSubmissionPayload(submissionId: string) {
 
 export async function fetchTeacherActivity() {
   const { data } = await http.get<TeacherActivityResponse>('/api/v1/admin/auth/activity')
+  return data
+}
+
+export async function fetchAuthorizedTeacherKeys() {
+  const { data } = await http.get<AuthorizedTeacherKeyView[]>('/api/v1/admin/teacher-keys')
+  return data
+}
+
+export async function addAuthorizedTeacherKey(publicKeyPem: string) {
+  const { data } = await http.post<AuthorizedTeacherKeyView>('/api/v1/admin/teacher-keys', {
+    public_key_pem: publicKeyPem,
+  })
+  return data
+}
+
+export async function deleteAuthorizedTeacherKey(fingerprint: string) {
+  const { data } = await http.delete<AuthorizedTeacherKeyView>(
+    `/api/v1/admin/teacher-keys/${encodeURIComponent(fingerprint)}`,
+  )
   return data
 }
 

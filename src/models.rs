@@ -213,6 +213,17 @@ pub struct AdminLoginResponse {
     pub expires_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdminAddTeacherKeyRequest {
+    pub public_key_pem: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthorizedTeacherKeyView {
+    pub fingerprint: String,
+    pub file_name: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TeacherActivityResponse {
     pub recent_challenges: Vec<TeacherChallengeView>,

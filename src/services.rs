@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,8 +20,8 @@ use zip::ZipArchive;
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AdminTokenRecord, Envelope, LinkInspectionRecord, SubmissionMode, SubmissionRecord,
-    SubmissionStatus, TeacherChallengeRecord, TeacherTokenRecord,
+    AdminTokenRecord, AuthorizedTeacherKeyView, Envelope, LinkInspectionRecord, SubmissionMode,
+    SubmissionRecord, SubmissionStatus, TeacherChallengeRecord, TeacherTokenRecord,
 };
 use crate::storage::{remove_file_if_exists, Store};
 
@@ -263,6 +264,151 @@ pub fn public_key_fingerprint(public_key_pem: &str) -> AppResult<String> {
         .join(":");
 
     Ok(format!("SHA256:{fingerprint}"))
+}
+
+pub fn ensure_teacher_key_authorized(
+    config: &AppConfig,
+    public_key_pem: &str,
+) -> AppResult<String> {
+    let fingerprint = public_key_fingerprint(public_key_pem)?;
+    ensure_teacher_fingerprint_authorized(config, &fingerprint)?;
+    Ok(fingerprint)
+}
+
+pub fn ensure_teacher_fingerprint_authorized(
+    config: &AppConfig,
+    fingerprint: &str,
+) -> AppResult<()> {
+    let authorized = load_authorized_teacher_fingerprints(config)?;
+    if authorized.is_empty() {
+        return Err(AppError::forbidden("服务端未配置任何授权教师公钥"));
+    }
+
+    if authorized.contains(fingerprint) {
+        Ok(())
+    } else {
+        Err(AppError::forbidden("当前公钥未被授权为教师公钥"))
+    }
+}
+
+pub fn load_authorized_teacher_fingerprints(config: &AppConfig) -> AppResult<HashSet<String>> {
+    let mut fingerprints = HashSet::new();
+    if !config.authorized_teacher_keys_dir.exists() {
+        return Ok(fingerprints);
+    }
+
+    let entries = fs::read_dir(&config.authorized_teacher_keys_dir).map_err(|error| {
+        AppError::internal(format!("读取教师公钥目录失败: {error}"))
+    })?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| AppError::internal(format!("读取教师公钥条目失败: {error}")))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let public_key_pem = fs::read_to_string(&path).map_err(|error| {
+            AppError::internal(format!("读取教师公钥文件失败 {}: {error}", path.display()))
+        })?;
+        let fingerprint = public_key_fingerprint(&public_key_pem).map_err(|error| {
+            AppError::internal(format!("教师公钥文件无效 {}: {error}", path.display()))
+        })?;
+        fingerprints.insert(fingerprint);
+    }
+
+    Ok(fingerprints)
+}
+
+pub fn list_authorized_teacher_keys(config: &AppConfig) -> AppResult<Vec<AuthorizedTeacherKeyView>> {
+    let mut items = Vec::new();
+    if !config.authorized_teacher_keys_dir.exists() {
+        return Ok(items);
+    }
+
+    let entries = fs::read_dir(&config.authorized_teacher_keys_dir).map_err(|error| {
+        AppError::internal(format!("读取教师公钥目录失败: {error}"))
+    })?;
+
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| AppError::internal(format!("读取教师公钥条目失败: {error}")))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let public_key_pem = fs::read_to_string(&path).map_err(|error| {
+            AppError::internal(format!("读取教师公钥文件失败 {}: {error}", path.display()))
+        })?;
+        let fingerprint = public_key_fingerprint(&public_key_pem).map_err(|error| {
+            AppError::internal(format!("教师公钥文件无效 {}: {error}", path.display()))
+        })?;
+        items.push(AuthorizedTeacherKeyView {
+            fingerprint,
+            file_name: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+
+    items.sort_by(|left, right| left.fingerprint.cmp(&right.fingerprint));
+    Ok(items)
+}
+
+pub fn add_authorized_teacher_key(
+    config: &AppConfig,
+    public_key_pem: &str,
+) -> AppResult<AuthorizedTeacherKeyView> {
+    let fingerprint = public_key_fingerprint(public_key_pem)?;
+    let file_name = authorized_teacher_key_file_name(&fingerprint);
+    let path = config.authorized_teacher_keys_dir.join(&file_name);
+
+    if path.exists() {
+        return Err(AppError::conflict("该教师公钥已在白名单中"));
+    }
+
+    fs::create_dir_all(&config.authorized_teacher_keys_dir)
+        .map_err(|error| AppError::internal(format!("创建教师公钥目录失败: {error}")))?;
+    fs::write(&path, public_key_pem)
+        .map_err(|error| AppError::internal(format!("写入教师公钥文件失败: {error}")))?;
+
+    Ok(AuthorizedTeacherKeyView {
+        fingerprint,
+        file_name,
+    })
+}
+
+pub fn remove_authorized_teacher_key(
+    config: &AppConfig,
+    fingerprint: &str,
+) -> AppResult<AuthorizedTeacherKeyView> {
+    let item = find_authorized_teacher_key(config, fingerprint)?
+        .ok_or_else(|| AppError::not_found("指定教师公钥不在白名单中"))?;
+    let path = config.authorized_teacher_keys_dir.join(&item.file_name);
+    remove_file_if_exists(&path)?;
+    Ok(item)
+}
+
+fn find_authorized_teacher_key(
+    config: &AppConfig,
+    fingerprint: &str,
+) -> AppResult<Option<AuthorizedTeacherKeyView>> {
+    let items = list_authorized_teacher_keys(config)?;
+    Ok(items
+        .into_iter()
+        .find(|item| item.fingerprint.eq_ignore_ascii_case(fingerprint)))
+}
+
+fn authorized_teacher_key_file_name(fingerprint: &str) -> String {
+    let sanitized = fingerprint
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    format!("{sanitized}.pem")
 }
 
 pub fn build_submission_record(

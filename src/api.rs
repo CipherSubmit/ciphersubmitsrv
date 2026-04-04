@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use chrono::Utc;
@@ -16,7 +16,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AdminLoginRequest, AdminLoginResponse, ChallengeResponse, CleanupResponse, DownloadDescriptor,
+    AdminAddTeacherKeyRequest, AdminLoginRequest, AdminLoginResponse,
+    AuthorizedTeacherKeyView, ChallengeResponse, CleanupResponse, DownloadDescriptor,
     E2EEnvelopeMetadata, FetchItem, ItemsResponse, RetentionPolicyView, RetentionStatus,
     RetrievalEventView, SubmissionAcceptedResponse, SubmissionDetailResponse, SubmissionMode,
     SubmissionOverviewItem, SubmissionStatus, TeacherActivityResponse, TeacherChallengeView,
@@ -87,6 +88,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/admin/auth/login", post(admin_login))
         .route("/api/v1/admin/overview", get(admin_overview))
+        .route(
+            "/api/v1/admin/teacher-keys",
+            get(admin_list_teacher_keys).post(admin_add_teacher_key),
+        )
+        .route(
+            "/api/v1/admin/teacher-keys/{fingerprint}",
+            delete(admin_delete_teacher_key),
+        )
         .route(
             "/api/v1/admin/submissions/download/{submission_id}",
             get(admin_download_submission_payload),
@@ -244,7 +253,7 @@ async fn request_teacher_challenge(
 ) -> AppResult<Json<ChallengeResponse>> {
     ensure_non_empty(&payload.public_key_pem, "public_key_pem")?;
 
-    let fingerprint = services::public_key_fingerprint(&payload.public_key_pem)?;
+    let fingerprint = services::ensure_teacher_key_authorized(&state.config, &payload.public_key_pem)?;
     let challenge_id = services::generate_challenge_id();
     let challenge_bytes = services::generate_random_challenge();
     let encrypted = services::encrypt_challenge(&payload.public_key_pem, &challenge_bytes)?;
@@ -284,7 +293,8 @@ async fn verify_teacher_challenge(
         return Err(AppError::forbidden("挑战已过期"));
     }
 
-    let current_fingerprint = services::public_key_fingerprint(&payload.public_key_pem)?;
+    let current_fingerprint =
+        services::ensure_teacher_key_authorized(&state.config, &payload.public_key_pem)?;
     if current_fingerprint != challenge.public_key_fingerprint {
         return Err(AppError::forbidden("公钥指纹与挑战记录不匹配"));
     }
@@ -412,6 +422,40 @@ async fn admin_overview(
         .collect::<Vec<_>>();
 
     Ok(Json(items))
+}
+
+async fn admin_list_teacher_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<Vec<AuthorizedTeacherKeyView>>> {
+    let _token = authorize_admin(&state, &headers)?;
+    Ok(Json(services::list_authorized_teacher_keys(&state.config)?))
+}
+
+async fn admin_add_teacher_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminAddTeacherKeyRequest>,
+) -> AppResult<Json<AuthorizedTeacherKeyView>> {
+    let _token = authorize_admin(&state, &headers)?;
+    ensure_non_empty(&payload.public_key_pem, "public_key_pem")?;
+    Ok(Json(services::add_authorized_teacher_key(
+        &state.config,
+        &payload.public_key_pem,
+    )?))
+}
+
+async fn admin_delete_teacher_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(fingerprint): AxumPath<String>,
+) -> AppResult<Json<AuthorizedTeacherKeyView>> {
+    let _token = authorize_admin(&state, &headers)?;
+    ensure_non_empty(&fingerprint, "fingerprint")?;
+    Ok(Json(services::remove_authorized_teacher_key(
+        &state.config,
+        &fingerprint,
+    )?))
 }
 
 async fn admin_submission_detail(
@@ -547,6 +591,11 @@ fn authorize_teacher(state: &AppState, headers: &HeaderMap) -> AppResult<String>
     if expires_at <= Utc::now() {
         return Err(AppError::unauthorized("Bearer Token 已过期"));
     }
+
+    services::ensure_teacher_fingerprint_authorized(
+        &state.config,
+        &record.bound_public_key_fingerprint,
+    )?;
 
     Ok(record.token)
 }
@@ -729,6 +778,7 @@ mod tests {
             frontend_dist_dir: temp_dir.path().join("frontend-dist"),
             tls_cert_path: data_dir.join("tls/server-cert.pem"),
             tls_key_path: data_dir.join("tls/server-key.pem"),
+            authorized_teacher_keys_dir: data_dir.join("teacher_keys"),
             admin_username: "admin".to_string(),
             admin_password: "admin123".to_string(),
             challenge_ttl_secs: 300,
